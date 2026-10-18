@@ -17,6 +17,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Show raw GitHub Models responses (diagnostics)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "== catalog"; curl -sS -m 30 -D - -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://models.github.ai/catalog/models | head -c 1500; echo
+          echo "== inference"; curl -sS -m 60 -D - -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://models.github.ai/inference/chat/completions -d '{"model":"openai/gpt-4.1","messages":[{"role":"user","content":"Reply with the single word PONG"}]}' | head -c 1500; echo
+          echo "== azure"; curl -sS -m 60 -D - -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" https://models.inference.ai.azure.com/chat/completions -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Reply with the single word PONG"}]}' | head -c 1500; echo
+
       - name: Ask the LLM fallback three test questions
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
