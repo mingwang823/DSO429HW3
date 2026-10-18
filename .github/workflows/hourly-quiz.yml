@@ -1,42 +1,99 @@
 name: hourly-quiz
 
+# A long-running "watcher" job polls for new rounds every 45 s near the top of
+# each hour (every 150 s otherwise) and pushes answers as soon as a round
+# appears. Each watcher runs ~5.5 h and queues its own successor through
+# workflow_dispatch (the one event GITHUB_TOKEN is allowed to trigger), so the
+# chain never depends on GitHub's cron, which in practice fires only every
+# 2-5 hours on this repo. The cron stays as a backstop that restarts the chain
+# if it ever breaks; extra runs just wait in the concurrency queue.
+
 on:
   schedule:
-    # every 5 minutes, offset from the :00 congestion peak
     - cron: "2-59/5 * * * *"
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "answers/**"
-      - "state/**"
-      - "STATUS.md"
 
 permissions:
   contents: write
   issues: write
   models: read
+  actions: write
 
 concurrency:
   group: hourly-quiz
   cancel-in-progress: false
 
+env:
+  # After this moment the last round (168, released 2026-10-22T20:00Z) can no
+  # longer earn credit, so the chain stops re-queueing itself.
+  QUIZBOT_STOP_AFTER: "2026-10-23T09:00:00Z"
+  WATCH_SECONDS: "19800"   # 5 h 30 min; the job timeout below leaves 20 min slack
+
 jobs:
   answer:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Answer new quiz rounds
-        run: python3 run.py --git
+      - name: Queue the next watcher
+        # Queued now so the chain survives even if this job crashes or is
+        # cancelled: the successor waits in the concurrency group and starts
+        # the moment this one ends.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$(date -u +%s)" -ge "$(date -u -d "$QUIZBOT_STOP_AFTER" +%s)" ]; then
+            echo "assignment over; not queueing a successor"
+          else
+            gh workflow run hourly-quiz.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              || echo "::warning::could not queue the next watcher"
+          fi
+
+      - name: Watch for new rounds and answer them
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           QUIZBOT_ALLOW_RESET: "1"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          end=$(( $(date -u +%s) + WATCH_SECONDS ))
+          stop=$(date -u -d "$QUIZBOT_STOP_AFTER" +%s)
+          failures=0
+          passes=0
+          while :; do
+            # Load the newest code + answers before starting Python, so code
+            # pushed while this watcher runs takes effect on the next pass.
+            git fetch -q origin main && git reset -q --hard origin/main \
+              || echo "::warning::could not sync with origin/main"
+            if ! python3 -B run.py --git; then
+              failures=$((failures + 1))
+              echo "::error::run.py --git failed (failure #$failures)"
+            fi
+            passes=$((passes + 1))
+            now=$(date -u +%s)
+            if [ "$now" -ge "$end" ] || [ "$now" -ge "$stop" ]; then break; fi
+            minute=$(( 10#$(date -u +%M) ))
+            if [ "$minute" -lt 20 ]; then sleep 45; else sleep 150; fi
+          done
+          echo "watcher finished after $passes passes, $failures failed"
+          # A failed pass fails the job, so GitHub emails the repo owner.
+          [ "$failures" -eq 0 ]
 
-      # After solving, so a failing test never blocks answering,
-      # but still fails the run (GitHub then emails the repo owner).
-      - name: Run tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Make sure a successor is queued
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$(date -u +%s)" -ge "$(date -u -d "$QUIZBOT_STOP_AFTER" +%s)" ]; then exit 0; fi
+          waiting=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow hourly-quiz.yml \
+                      --json status --jq '[.[] | select(.status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested")] | length' \
+                    || echo 0)
+          if [ "$waiting" = "0" ]; then
+            gh workflow run hourly-quiz.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              || echo "::warning::could not queue the next watcher"
+          else
+            echo "successor already queued ($waiting)"
+          fi

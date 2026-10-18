@@ -1,0 +1,27 @@
+name: tests
+
+# Runs on every code push, separately from the watcher (which would otherwise
+# queue this behind a 5.5 h job). A failure makes GitHub email the repo owner.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "answers/**"
+      - "state/**"
+      - "STATUS.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 -B -m unittest discover -s tests -v
+      - name: Practice set must be 1200/1200
+        run: python3 -B run.py --check-practice
