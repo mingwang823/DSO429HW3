@@ -28,4 +28,7 @@ if [ ! -f "$CLONE/run.py" ]; then
   exit 0
 fi
 cd "$CLONE"
+# Load the newest code before Python starts (run.py --git resets again, but by
+# then its own modules are already imported).
+git fetch -q origin main && git reset -q --hard origin/main || echo "could not sync with origin/main"
 python3 run.py --git
