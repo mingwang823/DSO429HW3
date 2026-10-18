@@ -6,10 +6,11 @@ Fetch order (freshest first, GitHub's raw CDN can lag several minutes):
 2. GitHub REST contents API (``Accept: application/vnd.github.raw``)
 3. ``raw.githubusercontent.com`` with a cache-busting query string
 
-Every source is header-validated; a source that returns something other than
-the expected CSV (an HTML error page, a truncated file, ...) falls through to
-the next one.  Parsing never crashes the run: malformed rows are skipped with a
-warning.
+Every source is header-validated (by column *name*: extra or reordered columns are
+fine, but all 8 required names must be present); a source that returns something
+other than the expected CSV (an HTML error page, a truncated file, ...) falls
+through to the next one.  Parsing never crashes the run: malformed rows are
+skipped with a warning, and an unterminated quote costs at most its own row.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import io
 import json
 import logging
 import os
+import re
 import ssl
 import subprocess
 import tempfile
@@ -27,7 +29,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger("quizbot.source")
 
@@ -44,6 +46,7 @@ EXPECTED_HEADER = [
     "option_d",
 ]
 NUM_QUESTIONS = 25
+MAX_ROUND_ID = 9999          # answer files are named round-NNNN.json
 OPTION_LETTERS = ("A", "B", "C", "D")
 HTTP_TIMEOUT = 30
 CLONE_TIMEOUT = 90
@@ -99,60 +102,130 @@ def format_timestamp(dt: datetime) -> str:
 # --------------------------------------------------------------------------
 # CSV parsing
 # --------------------------------------------------------------------------
-def check_header(text: str) -> None:
-    """Raise SourceError unless the first CSV record is exactly the expected header."""
-    text = text.lstrip("﻿")
+# A physical line that begins a record: round_id,q_index,<ISO date>T...  Used to
+# recover from an unterminated quote, which would otherwise swallow every row
+# after it.  (Only meaningful while round_id, q_index, released_at come first,
+# which is how the instructors' file is laid out; with another column order the
+# recovery simply never triggers.)
+_RECORD_START = re.compile(r"^\d+,\d+,\d{4}-\d{2}-\d{2}T", re.MULTILINE)
+_EMBEDDED_START = re.compile(r"\n\d+,\d+,\d{4}-\d{2}-\d{2}T")
+
+Record = Tuple[int, List[str]]
+
+
+def _clean(text: str) -> str:
+    """Drop a BOM and any leading blank space so the header is the first record."""
+    return text.lstrip("\ufeff \t\r\n")
+
+
+def _header_index(cells: List[str]) -> Dict[str, int]:
+    """{column name: position}; names are compared stripped and case-insensitively.
+
+    Extra and reordered columns are fine, but every required name must exist -
+    which is also what rejects an HTML error page or a JSON document.
+    """
+    index: Dict[str, int] = {}
+    for pos, cell in enumerate(cells):
+        name = cell.replace("\ufeff", "").strip().lower()
+        index.setdefault(name, pos)
+    missing = [name for name in EXPECTED_HEADER if name not in index]
+    if missing:
+        shown = [c.strip()[:40] for c in cells[:10]]
+        raise SourceError("unexpected questions.csv header: missing %s (got %r)" % (", ".join(missing), shown))
+    return index
+
+
+def check_header(text: str) -> Dict[str, int]:
+    """Raise SourceError unless the first CSV record names all 8 required columns."""
+    text = _clean(text)
     try:
         header = next(csv.reader(io.StringIO(text, newline="")))
     except StopIteration:
         raise SourceError("questions.csv is empty")
     except csv.Error as exc:
         raise SourceError("questions.csv header unreadable: %s" % exc)
-    header = [h.strip() for h in header]
-    if header != EXPECTED_HEADER:
-        raise SourceError("unexpected questions.csv header: %r" % (header[:10],))
+    return _header_index(header)
 
 
-def parse_questions_csv(text: str) -> List[Round]:
-    """Parse CSV text into rounds sorted by round id.  Bad rows are skipped."""
-    check_header(text)
-    text = text.lstrip("﻿")
+def _read_records(text: str, line_offset: int = 0) -> List[Record]:
+    """csv-parse ``text`` into [(line number, cells)], skipping blank rows and csv errors."""
     reader = csv.reader(io.StringIO(text, newline=""))
-    rounds: Dict[int, Round] = {}
-    release_times: Dict[int, set] = {}
-    next(reader)  # header, already validated
-    lineno = 1
+    out: List[Record] = []
     while True:
         try:
             row = next(reader)
         except StopIteration:
             break
         except csv.Error as exc:
-            log.warning("CSV error near line %d: %s (row skipped)", lineno + 1, exc)
-            lineno += 1
+            log.warning("CSV error near line %d: %s (row skipped)", line_offset + reader.line_num, exc)
             continue
-        lineno = reader.line_num
         if not row or all(not c.strip() for c in row):
             continue
-        if len(row) != len(EXPECTED_HEADER):
-            log.warning("line %d: expected %d columns, got %d (row skipped)", lineno, len(EXPECTED_HEADER), len(row))
+        out.append((line_offset + reader.line_num, row))
+    return out
+
+
+def _records_by_start(text: str) -> List[Record]:
+    """Parse each record on its own, split at every line that looks like a record start.
+
+    An unterminated quote can then cost at most the row it is in.
+    """
+    starts = [m.start() for m in _RECORD_START.finditer(text)]
+    out: List[Record] = []
+    for i, begin in enumerate(starts):
+        stop = starts[i + 1] if i + 1 < len(starts) else len(text)
+        out.extend(_read_records(text[begin:stop], line_offset=text.count("\n", 0, begin)))
+    return out
+
+
+def parse_questions_csv(text: str) -> List[Round]:
+    """Parse CSV text into rounds sorted by round id.  Bad rows are skipped."""
+    text = _clean(text)
+    index = check_header(text)
+    records = _read_records(text)
+    if not records:                      # cannot happen after check_header; stay safe anyway
+        raise SourceError("questions.csv is empty")
+    header_cells = records[0][1]
+    data = records[1:]
+
+    # A stray quote makes the csv module read to the end of the file as one field.
+    # Detect that (fewer records than lines that look like record starts, or a
+    # start line buried inside a field) and re-parse record by record.
+    starts = len(_RECORD_START.findall(text))
+    swallowed = any(_EMBEDDED_START.search(cell) for _, row in data for cell in row)
+    if len(data) < starts or swallowed:
+        recovered = _records_by_start(text)
+        if len(recovered) > len(data):
+            log.warning("CSV has %d record-looking lines but parsed %d rows (unterminated quote?); "
+                        "re-parsed record by record: %d rows", starts, len(data), len(recovered))
+            data = recovered
+
+    width = len(header_cells)
+    rounds: Dict[int, Round] = {}
+    release_times: Dict[int, set] = {}
+    for lineno, row in data:
+        if len(row) != width:
+            log.warning("line %d: expected %d columns, got %d (row skipped)", lineno, width, len(row))
             continue
-        cells = [c.strip() for c in row]
+
+        def cell(name: str) -> str:
+            return row[index[name]].strip()
+
         try:
-            round_id = int(cells[0])
-            q_index = int(cells[1])
-            released = parse_timestamp(cells[2])
+            round_id = int(cell("round_id"))
+            q_index = int(cell("q_index"))
+            released = parse_timestamp(cell("released_at"))
         except (ValueError, OverflowError) as exc:
             log.warning("line %d: bad round_id/q_index/released_at (%s); row skipped", lineno, exc)
             continue
-        if round_id < 1:
-            log.warning("line %d: round_id %d out of range; row skipped", lineno, round_id)
+        if not 1 <= round_id <= MAX_ROUND_ID:
+            log.warning("line %d: round_id %d outside 1..%d; row skipped", lineno, round_id, MAX_ROUND_ID)
             continue
         if not 1 <= q_index <= NUM_QUESTIONS:
             log.warning("line %d: round %d q_index %d outside 1..%d; row skipped", lineno, round_id, q_index, NUM_QUESTIONS)
             continue
-        text_q = cells[3]
-        options = dict(zip(OPTION_LETTERS, cells[4:8]))
+        text_q = cell("question_text")
+        options = {letter: cell("option_%s" % letter.lower()) for letter in OPTION_LETTERS}
         if not text_q:
             log.warning("line %d: round %d q%d has empty question text; row skipped", lineno, round_id, q_index)
             continue

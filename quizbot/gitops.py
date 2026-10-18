@@ -1,11 +1,20 @@
 """Commit/push flow for ``run.py --git`` and GitHub issue notification.
 
-Flow per attempt (up to 5, with 5/10/20/30 s backoff between attempts):
+Two phases, so that LLM latency can never delay a rule answer:
+
+* phase 1 - rule answers (``guess`` placeholders for what the rules cannot solve) are
+  written, committed ("Answer round 49") and pushed first;
+* phase 2 - the LLM upgrade pass runs on top and, if it improved anything, a second
+  commit ("Update round 49") is pushed.
+
+Each phase is up to 5 attempts (5/10/20/30 s backoff between attempts):
 
 1. sync with ``origin/main``: ``fetch`` + ``reset --hard`` when ``QUIZBOT_ALLOW_RESET=1``
    (CI and the dedicated local backup clone), else ``pull --rebase``
-2. run the pipeline
-3. open GitHub issues for rounds with non-rule answers (Actions only, never fatal)
+   (phase 2 skips this on its first attempt: the tree was just pushed)
+2. run the pipeline (phase 1: rules only; phase 2: with the LLM)
+3. open GitHub issues for rounds with non-rule answers (Actions only, never fatal;
+   after phase 2 when there is one, so they show the final answers)
 4. nothing changed under ``answers state STATUS.md`` -> done
 5. commit + push; if the push is rejected, start over at 1
 """
@@ -18,7 +27,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from typing import Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import pipeline
 from .source import SourceError, ssl_context
@@ -263,50 +272,97 @@ def _letters_for(root: str, rid: int) -> Dict[str, str]:
 # --------------------------------------------------------------------------
 # the flow
 # --------------------------------------------------------------------------
-def run_git_flow(pipeline_fn: Callable[[], "pipeline.PipelineResult"], *, root: str,
-                 env: Optional[Mapping[str, str]] = None, runner: Optional[Callable] = None,
-                 sleep: Callable[[float], None] = time.sleep,
-                 issue_request: Optional[Callable] = None) -> int:
-    env = os.environ if env is None else env
-    allow_reset = env.get("QUIZBOT_ALLOW_RESET") == "1"
-    git = Git(root, runner)
+def _commit_and_push(git: Git, result: "pipeline.PipelineResult", env: Mapping[str, str],
+                     attempt: int) -> Optional[bool]:
+    """Commit what changed under TRACKED_PATHS and push.
+
+    Returns True when everything is pushed (or there was nothing to push), False when the
+    push was rejected/failed (the caller re-syncs and retries), None on a local git failure.
+    """
+    status = git.run("status", "--porcelain", "--", *TRACKED_PATHS)
+    if status.returncode != 0:
+        log.error("git status failed: %s", (status.stderr or "").strip()[:300])
+        return None
+    dirty = bool((status.stdout or "").strip())
+    if not dirty and _unpushed_commits(git) == 0:
+        log.info("nothing to commit")
+        return True
+    if dirty:
+        message = commit_message(result.new_rounds, result.updated_rounds)
+        add = git.run("add", "-A", "--", *TRACKED_PATHS)
+        if add.returncode != 0:
+            log.error("git add failed: %s", (add.stderr or "").strip()[:300])
+            return None
+        commit = git.run(*(_identity_args(git, env) + ["commit", "-m", message]))
+        if commit.returncode != 0:
+            log.error("git commit failed: %s", ((commit.stderr or "") + (commit.stdout or "")).strip()[:300])
+            return None
+        log.info("committed: %s", message)
+    push = git.run("push", "origin", "HEAD:main")
+    if push.returncode == 0:
+        log.info("pushed to origin/main")
+        return True
+    log.warning("push rejected/failed (attempt %d/%d): %s", attempt, MAX_ATTEMPTS, (push.stderr or "").strip()[:300])
+    return False
+
+
+def _push_loop(git: Git, step: Callable[[], "pipeline.PipelineResult"], *, env: Mapping[str, str],
+               allow_reset: bool, sleep: Callable[[float], None], issue_request: Optional[Callable],
+               open_issues: bool, sync_first: bool, root: str) -> Tuple[int, Optional["pipeline.PipelineResult"]]:
+    """Up to MAX_ATTEMPTS x (sync, ``step()``, issues, commit, push).  Returns (exit code, last result)."""
+    result = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             delay = BACKOFFS[min(attempt - 2, len(BACKOFFS) - 1)]
             log.info("attempt %d/%d in %d s", attempt, MAX_ATTEMPTS, delay)
             sleep(delay)
-        if not _sync(git, allow_reset):
+        if (attempt > 1 or sync_first) and not _sync(git, allow_reset):
             continue
         try:
-            result = pipeline_fn()
+            result = step()
         except SourceError as exc:
             log.error("cannot get the questions: %s", exc)
-            return 1
-        notify_issues(root, result.rounds, env, issue_request)
-
-        status = git.run("status", "--porcelain", "--", *TRACKED_PATHS)
-        if status.returncode != 0:
-            log.error("git status failed: %s", (status.stderr or "").strip()[:300])
-            continue
-        dirty = bool((status.stdout or "").strip())
-        if not dirty and _unpushed_commits(git) == 0:
-            log.info("nothing to commit")
-            return 0
-        if dirty:
-            message = commit_message(result.new_rounds, result.updated_rounds)
-            add = git.run("add", "-A", "--", *TRACKED_PATHS)
-            if add.returncode != 0:
-                log.error("git add failed: %s", (add.stderr or "").strip()[:300])
-                continue
-            commit = git.run(*(_identity_args(git, env) + ["commit", "-m", message]))
-            if commit.returncode != 0:
-                log.error("git commit failed: %s", ((commit.stderr or "") + (commit.stdout or "")).strip()[:300])
-                continue
-            log.info("committed: %s", message)
-        push = git.run("push", "origin", "HEAD:main")
-        if push.returncode == 0:
-            log.info("pushed to origin/main")
-            return 0
-        log.warning("push rejected/failed (attempt %d/%d): %s", attempt, MAX_ATTEMPTS, (push.stderr or "").strip()[:300])
+            return 1, result
+        if open_issues:
+            notify_issues(root, result.rounds, env, issue_request)
+        outcome = _commit_and_push(git, result, env, attempt)
+        if outcome:
+            return 0, result
     log.error("giving up after %d attempts", MAX_ATTEMPTS)
-    return 1
+    return 1, result
+
+
+def run_git_flow(pipeline_fn: Callable[[], "pipeline.PipelineResult"], *, root: str,
+                 env: Optional[Mapping[str, str]] = None, runner: Optional[Callable] = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 issue_request: Optional[Callable] = None,
+                 llm_pass_fn: Optional[Callable[["pipeline.PipelineResult"], "pipeline.PipelineResult"]] = None) -> int:
+    """sync -> ``pipeline_fn()`` -> commit -> push, then (optionally) the slow LLM upgrade pass.
+
+    Phase 1 must contain nothing slow: ``pipeline_fn`` writes the rule answers (with ``guess``
+    placeholders for questions the rules could not solve) and they are pushed straight away.
+    Phase 2, only when ``llm_pass_fn`` is given, calls ``llm_pass_fn(phase_1_result)`` - the
+    pipeline again, now with the LLM - and pushes a second commit ("Update round N") if it
+    changed anything.  An LLM that is slow or broken therefore never delays the rule answers.
+    Without ``llm_pass_fn`` the whole job is phase 1 (``pipeline_fn`` may use the LLM itself).
+    """
+    env = os.environ if env is None else env
+    allow_reset = env.get("QUIZBOT_ALLOW_RESET") == "1"
+    git = Git(root, runner)
+    common = dict(env=env, allow_reset=allow_reset, sleep=sleep, issue_request=issue_request, root=root)
+
+    # Issues list the final letters and methods, so with an LLM pass they wait for it.
+    rc, first = _push_loop(git, pipeline_fn, open_issues=llm_pass_fn is None, sync_first=True, **common)
+    if rc != 0 or llm_pass_fn is None or first is None:
+        return rc
+
+    def llm_step() -> "pipeline.PipelineResult":
+        return llm_pass_fn(first)
+
+    try:
+        # The tree is in sync with origin right after phase 1, so the first attempt skips the sync.
+        rc2, _second = _push_loop(git, llm_step, open_issues=True, sync_first=False, **common)
+    except Exception as exc:  # the rule answers are already pushed; report the crash but stay loud
+        log.exception("LLM upgrade pass crashed: %s: %s", type(exc).__name__, exc)
+        return 1
+    return rc2

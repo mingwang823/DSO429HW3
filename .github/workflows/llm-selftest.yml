@@ -1,0 +1,23 @@
+name: llm-selftest
+
+# Manual check that the free GitHub Models fallback answers correctly from
+# inside Actions (it is only used for question types the rule solver does not
+# know). Writes nothing to the repo.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ask the LLM fallback three test questions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -B run.py --llm-selftest

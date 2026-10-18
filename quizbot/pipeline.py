@@ -9,6 +9,14 @@ Decision rules per round present in the source CSV (``now`` is injectable):
                                           a method is never downgraded
 * file but no state entry              -> untouched (could be a manual edit)
 * file + state entry, not editable     -> untouched
+* released_at more than 60 s ahead     -> skipped ("not released yet")
+
+LLM fallback: a question that stays at the ``guess`` rank is re-sent to the LLM at
+most once every 30 minutes (the time of each attempt is kept in the state entry as
+``llm_attempted_at``), so a flaky or rate-limited model is not hammered by a
+watcher that runs every minute.  ``run_pipeline(llm_fn=None)`` is the fast first
+pass of the git flow (rule answers + guess placeholders); a second call with an
+``llm_fn`` is the upgrade pass.
 """
 from __future__ import annotations
 
@@ -20,7 +28,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 import quizbot
 from .llm import LLMAnswer, LLMItem
@@ -37,6 +45,8 @@ log = logging.getLogger("quizbot.pipeline")
 WINDOW = timedelta(hours=3)
 EDIT_MARGIN = timedelta(minutes=10)
 EDIT_WINDOW = WINDOW - EDIT_MARGIN  # editable while now < released_at + 2h50m
+FUTURE_SLACK = timedelta(seconds=60)          # clock skew tolerated before a round counts as "not released yet"
+LLM_RETRY_INTERVAL = timedelta(minutes=30)    # a guess-ranked question is re-sent to the LLM at most this often
 LETTERS = ("A", "B", "C", "D")
 RULE_RANK = 3
 METHOD_RANK = {"rule": 3, "llm": 2, "llm-disagree": 2, "guess": 1}
@@ -249,12 +259,17 @@ class Plan:
     existing: Optional[Dict[int, str]] = None  # letters in the existing file
 
 
-def plan_round(rnd: Round, root: str, state: dict, now: datetime) -> Plan:
+def plan_round(rnd: Round, root: str, state: dict, now: datetime,
+               also_editable: Collection[int] = ()) -> Plan:
+    """``also_editable``: round ids treated as inside the edit window whatever the clock says
+    (the rounds the first pass of this very run just answered, even if they were late)."""
     rid = rnd.round_id
     path = answer_path(root, rid)
     entry = state.get(str(rid))
     sha = rnd.content_hash()
     base = dict(round=rnd, sha=sha, entry=entry)
+    if rnd.released_at - now > FUTURE_SLACK:
+        return Plan(action="skip", reason="not released yet", **base)
     if not os.path.exists(path):
         return Plan(action="new", reason="no answer file", targets=list(ALL_INDEXES), **base)
     existing = load_existing_answers(path, rid)
@@ -266,7 +281,7 @@ def plan_round(rnd: Round, root: str, state: dict, now: datetime) -> Plan:
     if entry is None:
         return Plan(action="skip", reason="answer file has no state entry (manual edit?); left untouched",
                     existing=existing, **base)
-    if not is_editable(now, rnd.released_at):
+    if not is_editable(now, rnd.released_at) and rid not in also_editable:
         return Plan(action="skip", reason="past the edit window; left untouched", existing=existing, **base)
     if entry.get("questions_sha256") != sha:
         return Plan(action="resolve_all", reason="question content changed", targets=list(ALL_INDEXES),
@@ -277,6 +292,26 @@ def plan_round(rnd: Round, root: str, state: dict, now: datetime) -> Plan:
         return Plan(action="skip", reason="all questions already rule-solved", existing=existing, **base)
     return Plan(action="upgrade", reason="%d question(s) below rule rank" % len(targets), targets=targets,
                 existing=existing, **base)
+
+
+def _llm_attempts(entry: Optional[dict]) -> Dict[int, datetime]:
+    """{q_index: time of the last LLM attempt} from a state entry (malformed items are ignored)."""
+    raw = (entry or {}).get("llm_attempted_at")
+    out: Dict[int, datetime] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        try:
+            qi = int(str(key)[1:]) if str(key).startswith("q") else int(key)
+            out[qi] = parse_timestamp(str(value))
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return out
+
+
+def _throttled(last: Optional[datetime], now: datetime) -> bool:
+    """True when the LLM was asked about this question less than LLM_RETRY_INTERVAL ago."""
+    return last is not None and timedelta(0) <= now - last < LLM_RETRY_INTERVAL
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +347,9 @@ class PipelineResult:
 
     @property
     def updated_rounds(self) -> List[int]:
-        return sorted(r.round_id for r in self.results if r.file_changed and not r.is_new)
+        """Existing rounds whose file changed or whose answers were improved (new method, same letter)."""
+        return sorted(r.round_id for r in self.results
+                      if not r.is_new and r.action != "skip" and (r.file_changed or r.changed_questions))
 
 
 def _entry_answers(plan: Plan) -> Dict[int, Answer]:
@@ -328,14 +365,15 @@ def _entry_answers(plan: Plan) -> Dict[int, Answer]:
 def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
                  solver: Optional[Callable] = None,
                  llm_fn: Optional[Callable[[List[LLMItem]], Dict[str, LLMAnswer]]] = None,
-                 dry_run: bool = False, min_round: int = 1) -> PipelineResult:
+                 dry_run: bool = False, min_round: int = 1,
+                 also_editable: Collection[int] = ()) -> PipelineResult:
     now = now.astimezone(timezone.utc)
     solver = solver or default_solver()
     state = load_state(root)
     if not dry_run:
         cleanup_stray_tmp(root)
 
-    plans = [plan_round(r, root, state, now) for r in sorted(rounds, key=lambda r: r.round_id)
+    plans = [plan_round(r, root, state, now, also_editable) for r in sorted(rounds, key=lambda r: r.round_id)
              if r.round_id >= min_round]
     rounds_by_id = {r.round_id: r for r in rounds}
 
@@ -348,6 +386,7 @@ def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
             continue
         rid = plan.round.round_id
         old = _entry_answers(plan) if plan.action == "upgrade" else {}
+        last_attempt = _llm_attempts(plan.entry) if plan.action == "upgrade" else {}
         for qi in plan.targets:
             question = plan.round.questions.get(qi)
             if question is None:
@@ -358,20 +397,31 @@ def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
                 candidates[(rid, qi)] = ans
                 continue
             notes[(rid, qi)] = note
-            # An existing LLM answer is not re-asked (it can only be upgraded by a rule).
-            if plan.action == "upgrade" and old[qi].rank >= 2:
-                continue
+            if plan.action == "upgrade":
+                # An existing LLM answer is not re-asked (it can only be upgraded by a rule),
+                # and a guess is re-asked at most once per LLM_RETRY_INTERVAL.
+                if old[qi].rank >= 2 or _throttled(last_attempt.get(qi), now):
+                    continue
             llm_items.append(LLMItem("r%dq%d" % (rid, qi), question.text, dict(question.options)))
 
-    # ---- LLM fallback (one batched call for the whole run) ----------------
+    # ---- LLM fallback (one batched call for the whole pass) ----------------
     llm_answers: Dict[str, LLMAnswer] = {}
+    attempted: Dict[int, List[int]] = {}      # round id -> question indexes the LLM was really asked about
     if llm_items and llm_fn is not None:
         log.info("asking the LLM fallback about %d question(s)", len(llm_items))
+        unattempted: set = set()
         try:
-            llm_answers = llm_fn(llm_items) or {}
+            llm_answers = llm_fn(llm_items)
+            if llm_answers is None:      # NB: not `or {}` - an empty LLMResults still carries .unattempted
+                llm_answers = {}
+            unattempted = set(getattr(llm_answers, "unattempted", ()) or ())
         except Exception as exc:
             log.warning("LLM fallback raised %s: %s", type(exc).__name__, exc)
             llm_answers = {}
+        for item in llm_items:
+            if item.id not in unattempted:
+                r_id, q_idx = (int(x) for x in item.id[1:].split("q"))
+                attempted.setdefault(r_id, []).append(q_idx)
     for item in llm_items:
         rid, qi = (int(x) for x in item.id[1:].split("q"))
         got = llm_answers.get(item.id)
@@ -393,6 +443,9 @@ def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
             results.append(RoundResult(rid, "skip", plan.reason))
             continue
         res = RoundResult(rid, plan.action, plan.reason, is_new=(plan.action == "new"))
+        # LLM attempt times: kept across upgrades, restarted when the questions are solved afresh.
+        old_attempts = {"q%d" % qi: format_timestamp(t) for qi, t in
+                        (_llm_attempts(plan.entry) if plan.action == "upgrade" else {}).items()}
         if plan.action == "upgrade":
             final = _entry_answers(plan)
             for qi in plan.targets:
@@ -400,7 +453,14 @@ def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
                 if cand is not None and cand.rank > final[qi].rank:
                     final[qi] = cand
                     res.changed_questions.append(qi)
-            if not res.changed_questions:
+        else:
+            final = {i: candidates[(rid, i)] for i in ALL_INDEXES}
+        attempts = dict(old_attempts)
+        for qi in attempted.get(rid, []):
+            attempts["q%d" % qi] = format_timestamp(now)
+        attempts = {k: v for k, v in attempts.items() if final[int(k[1:])].rank < 2}  # solved since: forget
+        if plan.action == "upgrade":
+            if not res.changed_questions and attempts == old_attempts:
                 log.debug("round %d: nothing improved", rid)
                 res.action, res.reason = "skip", "no improvement"
                 results.append(res)
@@ -408,24 +468,28 @@ def run_pipeline(rounds: Sequence[Round], *, root: str, now: datetime,
             res.state_changed = True
             res.file_changed = any(final[i].letter != plan.existing[i] for i in ALL_INDEXES)
         else:
-            final = {i: candidates[(rid, i)] for i in ALL_INDEXES}
             res.state_changed = True
             res.file_changed = plan.existing is None or any(final[i].letter != plan.existing[i] for i in ALL_INDEXES)
             res.changed_questions = list(ALL_INDEXES)
         res.answers = final
 
         old_entry = plan.entry or {}
+        bookkeeping_only = plan.action == "upgrade" and not res.changed_questions   # just LLM attempt times
         new_state[str(rid)] = {
             "released_at": format_timestamp(rnd.released_at),
             "questions_sha256": plan.sha,
             "answered_at": old_entry.get("answered_at") if plan.action != "new" and old_entry.get("answered_at")
             else format_timestamp(now),
-            "updated_at": format_timestamp(now),
-            "solver_version": quizbot.SOLVER_VERSION,
+            "updated_at": (old_entry.get("updated_at") or format_timestamp(now)) if bookkeeping_only
+            else format_timestamp(now),
+            "solver_version": (old_entry.get("solver_version") or quizbot.SOLVER_VERSION) if bookkeeping_only
+            else quizbot.SOLVER_VERSION,
             "methods": {"q%d" % i: final[i].method for i in ALL_INDEXES},
             "details": {"q%d" % i: final[i].detail for i in ALL_INDEXES},
             "issue_opened": bool(old_entry.get("issue_opened", False)),
         }
+        if attempts:
+            new_state[str(rid)]["llm_attempted_at"] = attempts
         if res.file_changed:
             obj = build_answers_obj(rid, {i: final[i].letter for i in ALL_INDEXES})
             validate_answers_obj(obj, rid)

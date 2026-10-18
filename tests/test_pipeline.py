@@ -196,10 +196,127 @@ class CsvParsingTest(unittest.TestCase):
         self.assertEqual(rounds[0].released_at, datetime(2026, 10, 17, 20, 59, tzinfo=UTC))
 
     def test_header_validation(self):
+        # an extra column is fine now (see test_header_is_matched_by_name_...); a missing name is not
         for bad in ("", "<html>404</html>", "round_id,q_index\n1,2\n",
-                    HEADER + ",extra\n", HEADER.replace("q_index", "question_index") + "\n"):
+                    HEADER.replace("q_index", "question_index") + "\n"):
             with self.assertRaises(source.SourceError):
                 source.parse_questions_csv(bad)
+
+    # ---- finding 1: header matched by NAME --------------------------------------
+    def test_header_is_matched_by_name_extra_and_reordered_columns(self):
+        row = ["49", "1", "2026-10-17T21:00:00Z", "Q one", "o1", "o2", "o3", "o4"]
+        # the reviewer's repro: one extra trailing column
+        rounds = source.parse_questions_csv(HEADER + ",extra\n49,1,2026-10-17T21:00:00Z,Q,A,B,C,D,x\n")
+        self.assertEqual(rounds[0].questions[1].options, {"A": "A", "B": "B", "C": "C", "D": "D"})
+        # extra column in the middle, columns reordered, a trailing comment column
+        names = ["note", "option_d", "question_text", "released_at", "option_b", "q_index", "option_a",
+                 "round_id", "option_c", "id"]
+        values = {"note": "n", "option_d": "o4", "question_text": "Q one", "released_at": "2026-10-17T21:00:00Z",
+                  "option_b": "o2", "q_index": "1", "option_a": "o1", "round_id": "49", "option_c": "o3", "id": "99"}
+        text = ",".join(names) + "\n" + ",".join(values[n] for n in names) + "\n"
+        rounds = source.parse_questions_csv(text)
+        self.assertEqual([r.round_id for r in rounds], [49])
+        q = rounds[0].questions[1]
+        self.assertEqual((q.text, q.options), ("Q one", {"A": "o1", "B": "o2", "C": "o3", "D": "o4"}))
+        self.assertEqual(rounds[0].released_at, datetime(2026, 10, 17, 21, 0, tzinfo=UTC))
+        # a plain row still works with the original layout
+        self.assertEqual(source.parse_questions_csv(make_csv([",".join(row)]))[0].questions[1].text, "Q one")
+
+    def test_header_names_tolerate_case_whitespace_quotes_bom_and_leading_blank_lines(self):
+        header = '\ufeff\n  \n" Round_ID ",Q_Index , released_at,Question_Text,OPTION_A,option_b,option_c ,"option_d"'
+        text = header + "\n49,1,2026-10-17T21:00:00Z,Q,1,2,3,4\n"
+        rounds = source.parse_questions_csv(text)
+        self.assertEqual(rounds[0].questions[1].options["D"], "4")
+        source.check_header(text)       # the fetch layer validates with check_header
+
+    def test_header_still_rejects_html_json_and_garbage(self):
+        bad = [
+            "<!DOCTYPE html><html><body>rate limited, a, b</body></html>",
+            '{"message": "Not Found", "documentation_url": "https://docs.github.com"}',
+            '[{"round_id": 1}]',
+            "just some text\nwith, commas, and lines\n",
+            "round_id,q_index,released_at,question_text,option_a,option_b,option_c\n1,1,x,y,1,2,3\n",   # no option_d
+            HEADER.replace("option_d", "option_e") + "\n",
+            "\ufeff",
+            "   \n\n",
+            '"unterminated,header\nnext line',
+        ]
+        for text in bad:
+            with self.assertRaises(source.SourceError, msg=text[:40]):
+                source.parse_questions_csv(text)
+            with self.assertRaises(source.SourceError, msg=text[:40]):
+                source.check_header(text)
+
+    def test_rows_must_match_the_header_width(self):
+        # with 9 header columns, a row of 8 cells is misaligned and is skipped (not guessed at)
+        text = HEADER + ",extra\n49,1,2026-10-17T21:00:00Z,Q,1,2,3,4\n49,2,2026-10-17T21:00:00Z,Q,1,2,3,4,x\n"
+        rounds = source.parse_questions_csv(text)
+        self.assertEqual(sorted(rounds[0].questions), [2])
+
+    # ---- finding 5: round_id range ---------------------------------------------------
+    def test_round_id_must_be_1_to_9999(self):
+        lines = [
+            csv_line(1, 1, "2026-10-17T21:00:00Z", "low edge"),
+            csv_line(9999, 1, "2026-10-17T21:00:00Z", "high edge"),
+            csv_line(10000, 1, "2026-10-17T21:00:00Z", "too big"),
+            csv_line(100000000000000000000, 1, "2026-10-17T21:00:00Z", "absurd"),
+            csv_line(0, 1, "2026-10-17T21:00:00Z", "zero"),
+            csv_line(-5, 1, "2026-10-17T21:00:00Z", "negative"),
+            csv_line("9" * 5000, 1, "2026-10-17T21:00:00Z", "digit bomb"),
+            csv_line(49, 1, "2026-10-17T21:00:00Z", "normal"),
+        ]
+        with self.assertLogs("quizbot.source", level="WARNING") as logs:
+            logging.disable(logging.NOTSET)
+            try:
+                rounds = source.parse_questions_csv(make_csv(lines))
+            finally:
+                logging.disable(logging.CRITICAL)
+        self.assertEqual([r.round_id for r in rounds], [1, 49, 9999])
+        self.assertTrue(any("outside 1..9999" in m for m in logs.output), logs.output)
+
+    def test_bogus_round_ids_never_create_answer_files(self):
+        root = tempfile.mkdtemp(prefix="quizbot-test-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        lines = [csv_line(rid, i, "2026-10-17T21:00:00Z", "RULE C q%d" % i)
+                 for rid in (4900, 100000000000000000000, 10000) for i in range(1, 26)]
+        rounds = source.parse_questions_csv(make_csv(lines))
+        pipeline.run_pipeline(rounds, root=root, now=REL + timedelta(hours=1), solver=FakeSolver())
+        self.assertEqual(os.listdir(os.path.join(root, "answers")), ["round-4900.json"])
+
+    # ---- finding 6: an unterminated quote costs at most its own row --------------------
+    def test_unterminated_quote_costs_only_its_row(self):
+        # the reviewer's repro: one bad row, then a good round-50 row
+        text = HEADER + '\n49,1,2026-10-17T21:00:00Z,"oops,A,B,C,D\n' + \
+            csv_line(50, 1, "2026-10-17T22:00:00Z", "still here") + "\n"
+        rounds = source.parse_questions_csv(text)
+        self.assertEqual([r.round_id for r in rounds], [50])
+        self.assertEqual(rounds[0].questions[1].text, "still here")
+
+    def test_unterminated_quote_in_the_middle_keeps_every_other_row(self):
+        lines = [csv_line(49, i, "2026-10-17T21:00:00Z", "q%d" % i) for i in range(1, 11)]
+        lines[4] = '49,5,2026-10-17T21:00:00Z,"never closed,1,2,3,4'
+        lines += [csv_line(50, i, "2026-10-17T22:00:00Z", "r50 q%d" % i) for i in range(1, 26)]
+        for newline in ("\n", "\r\n"):
+            rounds = source.parse_questions_csv(make_csv(lines, newline=newline))
+            self.assertEqual([r.round_id for r in rounds], [49, 50], repr(newline))
+            self.assertEqual(sorted(rounds[0].questions), [1, 2, 3, 4, 6, 7, 8, 9, 10], repr(newline))
+            self.assertEqual(len(rounds[1].questions), 25)
+            self.assertEqual(rounds[1].questions[25].text, "r50 q25")
+
+    def test_unterminated_quote_in_first_and_last_row(self):
+        good = [csv_line(49, i, "2026-10-17T21:00:00Z", "q%d" % i) for i in (2, 3)]
+        lines = ['49,1,2026-10-17T21:00:00Z,"bad first,1,2,3,4'] + good + ['49,4,2026-10-17T21:00:00Z,"bad last,1,2,3,4']
+        rounds = source.parse_questions_csv(make_csv(lines))
+        self.assertEqual(sorted(rounds[0].questions), [2, 3])
+
+    def test_recovery_leaves_legit_multiline_fields_alone(self):
+        lines = ['49,1,2026-10-17T21:00:00Z,"line one\nline two",1,2,3,4',
+                 csv_line(49, 2, "2026-10-17T21:00:00Z", "plain"),
+                 '49,3,2026-10-17T21:00:00Z,"a, b\r\nc",1,2,3,4']
+        rounds = source.parse_questions_csv(make_csv(lines))
+        self.assertEqual(rounds[0].questions[1].text, "line one\nline two")
+        self.assertEqual(rounds[0].questions[3].text, "a, b\r\nc")
+        self.assertEqual(sorted(rounds[0].questions), [1, 2, 3])
 
     def test_timestamp_forms(self):
         self.assertEqual(source.parse_timestamp("2026-10-15T21:00:00Z"), datetime(2026, 10, 15, 21, tzinfo=UTC))
@@ -759,7 +876,7 @@ class LLMIntegrationTest(TempRootTest):
         self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=lambda items: {})   # LLM unavailable
         self.assertEqual(set(self.read_state()["49"]["methods"].values()), {"guess"})
         fn = self.fake_llm("D")
-        result = self.run_pipe([rnd], REL + timedelta(minutes=8), llm_fn=fn)
+        result = self.run_pipe([rnd], REL + timedelta(minutes=33), llm_fn=fn)       # 31 min later: asked again
         self.assertEqual(result.updated_rounds, [49])
         self.assertEqual(set(self.read_answers(49)["answers"].values()), {"D"})
 
@@ -781,6 +898,242 @@ class LLMIntegrationTest(TempRootTest):
         bad = lambda items: {i.id: llm.LLMAnswer("Z", "llm:m", "") for i in items}
         self.run_pipe([make_round(49, kind="HARD")], REL, llm_fn=bad)
         self.assertEqual(set(self.read_answers(49)["answers"].values()), {"A"})
+
+
+class NotReleasedYetTest(TempRootTest):
+    """Finding 4: a round whose released_at is more than 60 s ahead is not answered."""
+
+    def test_future_round_is_skipped_with_a_reason_and_writes_nothing(self):
+        future = make_round(49, released=REL + timedelta(hours=38))
+        result = self.run_pipe([future], REL)
+        self.assertEqual([(r.round_id, r.action, r.reason) for r in result.results],
+                         [(49, "skip", "not released yet")])
+        self.assertFalse(result.changed)
+        self.assertEqual(os.listdir(self.root), [])               # no answers/, no state, no STATUS.md
+
+    def test_the_60_second_boundary(self):
+        rnd = make_round(49)
+        just_over = self.run_pipe([rnd], REL - timedelta(seconds=61))
+        self.assertEqual(just_over.results[0].action, "skip")
+        self.assertEqual(os.listdir(self.root), [])
+        within_slack = self.run_pipe([rnd], REL - timedelta(seconds=60))      # exactly 60 s: clock skew allowed
+        self.assertEqual(within_slack.new_rounds, [49])
+
+    def test_round_is_answered_once_it_is_released(self):
+        rnd = make_round(49)
+        self.run_pipe([rnd], REL - timedelta(minutes=5))
+        self.assertFalse(os.path.exists(pipeline.answer_path(self.root, 49)))
+        result = self.run_pipe([rnd], REL + timedelta(seconds=30))
+        self.assertEqual(result.new_rounds, [49])
+        self.assertEqual(self.read_state()["49"]["answered_at"], "2026-10-17T21:00:30Z")   # never negative
+
+    def test_released_rounds_are_answered_while_a_later_one_waits(self):
+        rounds = [make_round(49), make_round(50, released=REL + timedelta(hours=1)),
+                  make_round(51, released=REL + timedelta(hours=2))]
+        result = self.run_pipe(rounds, REL + timedelta(hours=1, minutes=2))
+        self.assertEqual(result.new_rounds, [49, 50])
+        self.assertEqual([r.action for r in result.results], ["new", "new", "skip"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.root, "answers"))), ["round-0049.json", "round-0050.json"])
+        self.assertEqual(sorted(self.read_state()), ["49", "50"])
+
+    def test_future_round_with_an_existing_file_is_left_alone(self):
+        rnd = make_round(49)
+        self.run_pipe([rnd], REL + timedelta(minutes=1))
+        before = self.snapshot()
+        moved = make_round(49, released=REL + timedelta(days=1))          # the instructors re-scheduled it
+        result = self.run_pipe([moved], REL + timedelta(minutes=2))
+        self.assertEqual(result.results[0].reason, "not released yet")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_dry_run_reports_it(self):
+        result = self.run_pipe([make_round(49, released=REL + timedelta(hours=3))], REL, dry_run=True)
+        self.assertIn("round 49: skip - not released yet", pipeline.format_dry_run(result))
+
+
+class LLMThrottleTest(TempRootTest):
+    """Finding 2: guess-ranked questions go back to the LLM at most once per 30 minutes."""
+
+    def counting_llm(self, answer=None):
+        calls = []
+
+        def fn(items):
+            calls.append([i.id for i in items])
+            if answer is None:
+                return {}
+            return {i.id: llm.LLMAnswer(answer, "llm:m1", "asked") for i in items}
+
+        fn.calls = calls
+        return fn
+
+    def test_not_resent_within_30_minutes_but_resent_after(self):
+        rnd = make_round(49, kind="HARD")
+        fn = self.counting_llm()                                   # the LLM never answers
+        t0 = REL + timedelta(minutes=1)
+        self.run_pipe([rnd], t0, llm_fn=fn)
+        self.assertEqual(len(fn.calls), 1)
+        self.assertEqual(self.read_state()["49"]["llm_attempted_at"]["q1"], "2026-10-17T21:01:00Z")
+        for delta in (timedelta(minutes=1), timedelta(minutes=15), timedelta(minutes=29, seconds=59)):
+            result = self.run_pipe([rnd], t0 + delta, llm_fn=fn)
+            self.assertEqual(len(fn.calls), 1, delta)
+            self.assertFalse(result.changed, delta)                # not even a state rewrite
+        self.run_pipe([rnd], t0 + timedelta(minutes=30), llm_fn=fn)
+        self.assertEqual(len(fn.calls), 2)
+        self.assertEqual(self.read_state()["49"]["llm_attempted_at"]["q1"], "2026-10-17T21:31:00Z")
+        self.run_pipe([rnd], t0 + timedelta(minutes=45), llm_fn=fn)
+        self.assertEqual(len(fn.calls), 2)
+
+    def test_throttle_is_per_question(self):
+        texts = ["HARD B q%d" % i for i in range(1, 26)]
+        rnd = make_round(49, texts=texts)
+        fn = self.counting_llm()
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=fn)
+        state = self.read_state()
+        state["49"]["llm_attempted_at"].pop("q7")                  # pretend q7 was never attempted
+        state["49"]["llm_attempted_at"]["q8"] = "2026-10-17T20:00:00Z"   # q8 long ago
+        pipeline.save_state(self.root, state)
+        self.run_pipe([rnd], REL + timedelta(minutes=10), llm_fn=fn)
+        self.assertEqual(fn.calls[1], ["r49q7", "r49q8"])
+
+    def test_answered_questions_drop_out_of_the_attempt_list(self):
+        rnd = make_round(49, kind="HARD")
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=self.counting_llm())
+        self.assertEqual(len(self.read_state()["49"]["llm_attempted_at"]), 25)
+        self.run_pipe([rnd], REL + timedelta(minutes=40), llm_fn=self.counting_llm("C"))
+        self.assertNotIn("llm_attempted_at", self.read_state()["49"])
+        self.assertEqual(set(self.read_answers(49)["answers"].values()), {"C"})
+
+    def test_a_successful_llm_answer_is_not_asked_again(self):
+        rnd = make_round(49, kind="HARD")
+        fn = self.counting_llm("D")
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=fn)
+        self.run_pipe([rnd], REL + timedelta(hours=1), llm_fn=fn)
+        self.assertEqual(len(fn.calls), 1)
+
+    def test_changed_content_restarts_the_clock(self):
+        fn = self.counting_llm()
+        self.run_pipe([make_round(49, kind="HARD", letter="B")], REL + timedelta(minutes=1), llm_fn=fn)
+        changed = make_round(49, kind="HARD", letter="C")
+        self.run_pipe([changed], REL + timedelta(minutes=5), llm_fn=fn)
+        self.assertEqual(len(fn.calls), 2)                         # new questions are asked at once
+        self.assertEqual(self.read_state()["49"]["llm_attempted_at"]["q1"], "2026-10-17T21:05:00Z")
+
+    def test_questions_that_were_never_sent_do_not_start_the_clock(self):
+        rnd = make_round(49, kind="HARD")
+        calls = []
+
+        def unavailable(items):
+            calls.append(len(items))
+            res = llm.LLMResults()
+            res.unattempted.update(i.id for i in items)
+            return res
+
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=unavailable)
+        self.assertNotIn("llm_attempted_at", self.read_state()["49"])
+        before = self.snapshot()
+        result = self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=unavailable)
+        self.assertEqual(calls, [25, 25])                          # still eligible next time ...
+        self.assertFalse(result.changed)                           # ... and nothing was written for it
+        self.assertEqual(self.snapshot(), before)
+
+    def test_an_llm_that_raises_counts_as_an_attempt(self):
+        rnd = make_round(49, kind="HARD")
+        calls = []
+
+        def boom(items):
+            calls.append(1)
+            raise RuntimeError("down")
+
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=boom)
+        self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=boom)
+        self.assertEqual(len(calls), 1)
+
+    def test_attempt_bookkeeping_keeps_the_original_timestamps(self):
+        rnd = make_round(49, kind="HARD")
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=self.counting_llm())
+        entry = self.read_state()["49"]
+        self.run_pipe([rnd], REL + timedelta(minutes=35), llm_fn=self.counting_llm())
+        later = self.read_state()["49"]
+        self.assertEqual(later["updated_at"], entry["updated_at"])          # only the attempt times moved
+        self.assertEqual(later["methods"], entry["methods"])
+        self.assertEqual(later["llm_attempted_at"]["q1"], "2026-10-17T21:35:00Z")
+
+    def test_malformed_attempt_times_are_ignored(self):
+        rnd = make_round(49, kind="HARD")
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=None)
+        state = self.read_state()
+        state["49"]["llm_attempted_at"] = {"q1": "garbage", "q2": None, "zz": "2026-10-17T21:00:00Z", "q3": 5}
+        pipeline.save_state(self.root, state)
+        fn = self.counting_llm()
+        self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=fn)
+        self.assertEqual(len(fn.calls[0]), 25)
+
+    def test_future_dated_attempt_does_not_block_forever(self):
+        rnd = make_round(49, kind="HARD")
+        self.run_pipe([rnd], REL + timedelta(minutes=1), llm_fn=None)
+        state = self.read_state()
+        state["49"]["llm_attempted_at"] = {"q1": "2099-01-01T00:00:00Z"}
+        pipeline.save_state(self.root, state)
+        fn = self.counting_llm()
+        self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=fn)
+        self.assertIn("r49q1", fn.calls[0])
+
+
+class TwoPassTest(TempRootTest):
+    """Finding 2: pass 1 (llm_fn=None) writes rule answers + guess placeholders; pass 2 upgrades them."""
+
+    def mixed_round(self):
+        texts = ["RULE C q%d" % i for i in range(1, 21)] + ["HARD D q%d" % i for i in range(21, 26)]
+        return make_round(49, texts=texts)
+
+    def test_pass_one_never_calls_the_llm_and_pass_two_upgrades(self):
+        rnd = self.mixed_round()
+        first = self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=None)
+        self.assertEqual(first.new_rounds, [49])
+        answers = self.read_answers(49)["answers"]
+        self.assertEqual([answers["q20"], answers["q21"]], ["C", "A"])
+        self.assertEqual(self.read_state()["49"]["methods"]["q21"], "guess")
+        answered_at = self.read_state()["49"]["answered_at"]
+
+        fn = mock.Mock(side_effect=lambda items: {i.id: llm.LLMAnswer("B", "llm:m1", "asked") for i in items})
+        second = self.run_pipe([rnd], REL + timedelta(minutes=3), llm_fn=fn)
+        self.assertEqual([i.id for i in fn.call_args[0][0]], ["r49q%d" % i for i in range(21, 26)])
+        self.assertEqual(second.new_rounds, [])
+        self.assertEqual(second.updated_rounds, [49])
+        answers = self.read_answers(49)["answers"]
+        self.assertEqual([answers["q20"], answers["q21"], answers["q25"]], ["C", "B", "B"])
+        self.assertEqual(self.read_state()["49"]["answered_at"], answered_at)      # the rule answers' time stands
+
+    def test_updated_rounds_counts_an_improvement_that_keeps_the_letter(self):
+        rnd = self.mixed_round()
+        self.run_pipe([rnd], REL + timedelta(minutes=2), llm_fn=None)
+        same_as_placeholder = lambda items: {i.id: llm.LLMAnswer("A", "llm:m1", "asked") for i in items}
+        result = self.run_pipe([rnd], REL + timedelta(minutes=3), llm_fn=same_as_placeholder)
+        self.assertFalse(result.results[0].file_changed)
+        self.assertEqual(result.updated_rounds, [49])              # still worth a "Update round 49" commit
+        self.assertEqual(self.read_state()["49"]["methods"]["q21"], "llm:m1")
+
+    def test_late_round_is_upgraded_in_pass_two_only_if_pass_one_just_answered_it(self):
+        rnd = self.mixed_round()
+        late = REL + timedelta(hours=5)
+        first = self.run_pipe([rnd], late, llm_fn=None)
+        self.assertEqual(first.new_rounds, [49])
+        fn = mock.Mock(side_effect=lambda items: {i.id: llm.LLMAnswer("B", "llm:m1", "asked") for i in items})
+        # without the hint the round is past its edit window and is (correctly) left alone
+        untouched = self.run_pipe([rnd], late, llm_fn=fn)
+        fn.assert_not_called()
+        self.assertEqual(untouched.results[0].action, "skip")
+        # run.py passes the rounds pass 1 created, so a late round still gets its LLM answers
+        upgraded = self.run_pipe([rnd], late, llm_fn=fn, also_editable=[49])
+        self.assertEqual(upgraded.updated_rounds, [49])
+        self.assertEqual(self.read_answers(49)["answers"]["q25"], "B")
+
+    def test_also_editable_does_not_touch_other_locked_rounds(self):
+        locked = make_round(48, kind="HARD", released=REL - timedelta(days=1))
+        self.run_pipe([locked], REL - timedelta(days=1) + timedelta(minutes=1), llm_fn=None)
+        fn = mock.Mock(return_value={})
+        result = self.run_pipe([locked, self.mixed_round()], REL + timedelta(minutes=2), llm_fn=fn, also_editable=[49])
+        self.assertEqual([r.action for r in result.results], ["skip", "new"])
+        self.assertTrue(all(i.id.startswith("r49") for i in fn.call_args[0][0]))
 
 
 # ==========================================================================
@@ -1051,6 +1404,485 @@ class LLMRunTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 0)
 
 
+class LLMResilienceTest(unittest.TestCase):
+    """Finding 3: one failing call never discards what earlier calls returned."""
+
+    def ask(self, fake, its, **kw):
+        kw.setdefault("token", "tok")
+        with mock.patch("quizbot.llm._http_json", fake):
+            return llm.answer_questions(its, **kw)
+
+    @staticmethod
+    def urlopen_sequence(*steps):
+        """A urlopen replacement: each step is a JSON-able reply body or an exception to raise."""
+        queue = list(steps)
+
+        class Resp:
+            def __init__(self, step):
+                self.step = step
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                if isinstance(self.step, BaseException):
+                    raise self.step
+                return self.step if isinstance(self.step, bytes) else json.dumps(self.step).encode("utf-8")
+
+        def urlopen(req, timeout=None, context=None):
+            step = queue.pop(0)
+            if isinstance(step, urllib_error().URLError):
+                raise step
+            return Resp(step)
+
+        return urlopen
+
+    def test_http_json_maps_truncated_and_broken_bodies(self):
+        import http.client
+
+        cases = [
+            http.client.IncompleteRead(b"partial", 100),
+            http.client.RemoteDisconnected("closed"),
+            http.client.BadStatusLine("garbage"),
+            b"<html>not json</html>",
+            b"\xff\xfe not utf-8",
+            b"",
+            ConnectionResetError("reset"),
+        ]
+        for step in cases:
+            with mock.patch("quizbot.llm.urllib.request.urlopen", self.urlopen_sequence(step)):
+                with self.assertRaises(llm.LLMRequestError, msg=repr(step)):
+                    llm._http_json("POST", "http://x", {}, {"a": 1})
+
+    def test_http_json_maps_connect_failures(self):
+        err = urllib_error().URLError("dns failure")
+        with mock.patch("quizbot.llm.urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(llm.LLMRequestError) as ctx:
+                llm._http_json("GET", "http://x", {})
+        self.assertEqual(ctx.exception.status, 0)
+
+    def test_incomplete_read_on_the_second_call_keeps_the_first_models_answers(self):
+        import http.client
+
+        its = items(3)
+        good = {"choices": [{"message": {"content": reply({i.id: "B" for i in its})}}]}
+        urlopen = self.urlopen_sequence(good, http.client.IncompleteRead(b"x", 10))
+        with mock.patch("quizbot.llm.urllib.request.urlopen", urlopen):
+            got = llm.answer_questions(its, token="tok", models=["openai/o3", "openai/gpt-4o"])
+        self.assertEqual({k: (v.letter, v.method) for k, v in got.items()}, {i.id: ("B", "llm:openai/o3") for i in its})
+
+    def test_failure_on_chunk_two_keeps_chunk_one(self):
+        import http.client
+
+        its = items(4)
+        first = {"choices": [{"message": {"content": reply({"r49q1": "C", "r49q2": "D"})}}]}
+        urlopen = self.urlopen_sequence(first, http.client.IncompleteRead(b"x", 10))
+        with mock.patch("quizbot.llm.urllib.request.urlopen", urlopen):
+            got = llm.answer_questions(its, token="tok", models=["m1"], chunk_size=2, max_requests=2)
+        self.assertEqual({k: v.letter for k, v in got.items()}, {"r49q1": "C", "r49q2": "D"})
+        self.assertEqual(got.unattempted, set())                  # chunk 2 was really tried (and failed)
+
+    def test_any_exception_type_from_one_call_only_loses_that_call(self):
+        its = items(2)
+        fake = FakeModels({"m1": lambda b: reply({"r49q1": "A", "r49q2": "B"}), "m2": RuntimeError("surprise")})
+        got = self.ask(fake, its, models=["m1", "m2"])
+        self.assertEqual({k: v.letter for k, v in got.items()}, {"r49q1": "A", "r49q2": "B"})
+        self.assertEqual({v.method for v in got.values()}, {"llm:m1"})
+
+    def test_exception_while_parsing_the_second_reply_keeps_the_first(self):
+        its = items(2)
+        fake = FakeModels({"m1": lambda b: reply({"r49q1": "A", "r49q2": "B"}), "m2": lambda b: reply({})})
+        with mock.patch("quizbot.llm.parse_answers", side_effect=[{"r49q1": ("A", ""), "r49q2": ("B", "")},
+                                                                   RuntimeError("parser bug")]):
+            got = self.ask(fake, its, models=["m1", "m2"])
+        self.assertEqual({k: v.letter for k, v in got.items()}, {"r49q1": "A", "r49q2": "B"})
+
+    def test_failure_after_pass_one_keeps_pass_one_answers(self):
+        its = items(2)
+        fake = FakeModels({"m1": lambda b: reply({"r49q1": "A", "r49q2": "B"}), "m2": lambda b: reply({})})
+        calls = []
+
+        def flaky_ask(model, chunk, token, budget, dead):
+            calls.append(model)
+            if len(calls) == 2:
+                raise MemoryError("boom")                       # escapes even _ask's own handlers
+            return llm_ask(model, chunk, token, budget, dead)
+
+        llm_ask = llm._ask
+        with mock.patch("quizbot.llm._http_json", fake), mock.patch("quizbot.llm._ask", flaky_ask):
+            got = llm.answer_questions(its, token="tok", models=["m1", "m2"])
+        self.assertEqual({k: v.letter for k, v in got.items()}, {"r49q1": "A", "r49q2": "B"})
+
+    def test_ask_never_raises(self):
+        budget = llm.RunBudget()
+        fake = FakeModels({"m1": RuntimeError("x")})
+        with mock.patch("quizbot.llm._http_json", fake):
+            self.assertEqual(llm._ask("m1", items(1), "tok", budget, set()), (None, True))
+
+
+def urllib_error():
+    import urllib.error
+
+    return urllib.error
+
+
+class LLMBudgetTest(unittest.TestCase):
+    """Finding 2: overall LLM budget per process (120 s, 6 requests, one catalog fetch)."""
+
+    class Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+    def slow_fake(self, clock, seconds_per_request, replies=None):
+        everything = {"r49q%d" % i: "A" for i in range(1, 101)}
+        fake = FakeModels(replies or {"m1": lambda b: reply(everything), "m2": lambda b: reply(everything),
+                                      "m3": lambda b: reply(everything)})
+        inner = fake.__call__
+
+        def timed(method, url, headers, body=None, timeout=60):
+            fake.timeouts = getattr(fake, "timeouts", []) + [timeout]
+            clock.t += seconds_per_request
+            return inner(method, url, headers, body, timeout)
+
+        return fake, timed
+
+    def test_default_budget_is_120_seconds(self):
+        self.assertEqual(llm.LLM_TIME_BUDGET, 120)
+        self.assertEqual(llm.RunBudget().seconds, 120)
+
+    def test_requests_stop_when_the_time_budget_is_used_up(self):
+        clock = self.Clock()
+        fake, timed = self.slow_fake(clock, 50)
+        budget = llm.RunBudget(cap=6, seconds=120, clock=clock)
+        with mock.patch("quizbot.llm._http_json", timed):
+            got = llm.answer_questions(items(100), token="tok", models=["m1", "m2", "m3"], chunk_size=25, budget=budget)
+        # 50 s + 50 s, then 20 s left: a third request still starts (with a 20 s timeout); a fourth does not
+        self.assertEqual(len(fake.requests), 3)
+        self.assertEqual(fake.timeouts, [60, 60, 20])
+        self.assertEqual(budget.spent, 150)
+        self.assertEqual(len(got), 75)                       # chunks 1-3 answered, chunk 4 never asked
+        self.assertEqual(got.unattempted, {"r49q%d" % i for i in range(76, 101)})
+
+    def test_budget_is_shared_between_calls_of_one_process(self):
+        clock = self.Clock()
+        fake, timed = self.slow_fake(clock, 70)
+        budget = llm.RunBudget(cap=6, seconds=120, clock=clock)
+        with mock.patch("quizbot.llm._http_json", timed):
+            first = llm.answer_questions(items(2), token="tok", models=["m1"], budget=budget)
+            second = llm.answer_questions(items(2, prefix="r50q"), token="tok", models=["m1"], budget=budget)
+            third = llm.answer_questions(items(2, prefix="r51q"), token="tok", models=["m1"], budget=budget)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 0)                     # 70 s used, 50 s left, request starts but gets nothing ...
+        self.assertEqual(len(third), 0)
+        self.assertEqual(len(fake.requests), 2)              # ... and then the budget is gone
+        self.assertEqual(third.unattempted, {"r51q1", "r51q2"})
+
+    def test_request_cap_is_shared_between_calls(self):
+        fake = FakeModels({"m1": lambda b: reply({"r49q%d" % i: "A" for i in range(1, 11)})})
+        budget = llm.RunBudget(cap=3)
+        with mock.patch("quizbot.llm._http_json", fake):
+            for _ in range(5):
+                llm.answer_questions(items(2), token="tok", models=["m1"], budget=budget)
+        self.assertEqual(len(fake.requests), 3)
+
+    def test_catalog_is_fetched_once_per_process(self):
+        everything = {"r49q%d" % i: "A" for i in range(1, 11)}
+        fake = FakeModels({"openai/o3": lambda b: reply(everything)}, catalog=[{"id": "openai/o3"}])
+        urls = []
+
+        def counting(method, url, headers, body=None, timeout=60):
+            urls.append(url)
+            return fake(method, url, headers, body, timeout)
+
+        budget = llm.RunBudget()
+        with mock.patch("quizbot.llm._http_json", counting), mock.patch.dict(os.environ, {"QUIZ_LLM_MODELS": "openai/o3"}):
+            llm.answer_questions(items(2), token="tok", budget=budget)
+            llm.answer_questions(items(2, prefix="r50q"), token="tok", budget=budget)
+        self.assertEqual(urls.count(llm.CATALOG_URL), 1)
+        self.assertEqual(budget.used, 3)
+
+    def test_slow_catalog_counts_against_the_time_budget(self):
+        clock = self.Clock()
+        budget = llm.RunBudget(seconds=120, clock=clock)
+
+        def slow_catalog(method, url, headers, body=None, timeout=60):
+            clock.t += 25
+            raise llm.LLMRequestError(500, "down")
+
+        with mock.patch("quizbot.llm._http_json", slow_catalog):
+            llm.discover_models("tok", env={}, budget=budget)
+        self.assertEqual(budget.spent, 25)
+
+    def test_no_token_or_no_budget_means_nothing_was_attempted(self):
+        its = items(3)
+        with mock.patch("quizbot.llm.get_token", return_value=None):
+            got = llm.answer_questions(its)
+        self.assertEqual((dict(got), got.unattempted), ({}, {i.id for i in its}))
+        spent = llm.RunBudget(cap=1)
+        spent.used = 1
+        with mock.patch("quizbot.llm._http_json", FakeModels({})):
+            got = llm.answer_questions(its, token="tok", budget=spent)
+        self.assertEqual(got.unattempted, {i.id for i in its})
+
+    def test_questions_after_every_model_died_are_unattempted(self):
+        its = items(4)
+        fake = FakeModels({"m1": llm.LLMRequestError(429)})
+        with mock.patch("quizbot.llm._http_json", fake):
+            got = llm.answer_questions(its, token="tok", models=["m1"], chunk_size=2)
+        self.assertEqual(len(fake.requests), 1)
+        self.assertEqual(got.unattempted, {"r49q3", "r49q4"})    # chunk 1 was tried and failed; chunk 2 never sent
+
+    def test_inference_timeout_never_exceeds_the_remaining_budget(self):
+        clock = self.Clock()
+        clock.t = 0
+        budget = llm.RunBudget(seconds=30, clock=clock)
+        fake = FakeModels({"m1": lambda b: reply({"r49q1": "A"})})
+        seen = []
+
+        def spy(method, url, headers, body=None, timeout=60):
+            seen.append(timeout)
+            return fake(method, url, headers, body, timeout)
+
+        with mock.patch("quizbot.llm._http_json", spy):
+            llm.answer_questions(items(1), token="tok", models=["m1"], budget=budget)
+        self.assertEqual(seen, [30])
+
+
+class MemoizedLLMTest(unittest.TestCase):
+    def fn(self, letter="B"):
+        calls = []
+
+        def inner(its):
+            calls.append([i.id for i in its])
+            return {i.id: llm.LLMAnswer(letter, "llm:m1", "d") for i in its}
+
+        inner.calls = calls
+        return inner
+
+    def test_a_question_is_asked_once_per_process(self):
+        inner = self.fn()
+        memo = llm.MemoizedLLM(inner)
+        first = memo(items(3))
+        again = memo(items(3))
+        self.assertEqual(inner.calls, [["r49q1", "r49q2", "r49q3"]])
+        self.assertEqual(dict(first), dict(again))
+        self.assertEqual(memo.calls, 1)
+
+    def test_key_is_text_plus_options_not_the_id(self):
+        inner = self.fn()
+        memo = llm.MemoizedLLM(inner)
+        memo(items(2))
+        got = memo(items(2, prefix="r50q"))                       # same questions in another round
+        self.assertEqual(len(inner.calls), 1)
+        self.assertEqual(sorted(got), ["r50q1", "r50q2"])
+        other_options = [llm.LLMItem("r51q1", "Question 1?", {"A": "9", "B": "2", "C": "3", "D": "4"})]
+        memo(other_options)
+        self.assertEqual(inner.calls[1], ["r51q1"])               # same text, different options: new question
+
+    def test_duplicates_inside_one_call_are_sent_once(self):
+        inner = self.fn()
+        memo = llm.MemoizedLLM(inner)
+        dup = [llm.LLMItem("a", "Same?", {"A": "1"}), llm.LLMItem("b", "Same?", {"A": "1"})]
+        got = memo(dup)
+        self.assertEqual(inner.calls, [["a"]])
+        self.assertEqual(sorted(got), ["a", "b"])
+
+    def test_only_new_questions_are_sent(self):
+        inner = self.fn()
+        memo = llm.MemoizedLLM(inner)
+        memo(items(2))
+        memo(items(4))
+        self.assertEqual(inner.calls, [["r49q1", "r49q2"], ["r49q3", "r49q4"]])
+
+    def test_no_answer_is_remembered_too(self):
+        calls = []
+
+        def nothing(its):
+            calls.append(len(its))
+            return {}
+
+        memo = llm.MemoizedLLM(nothing)
+        self.assertEqual(dict(memo(items(2))), {})
+        self.assertEqual(dict(memo(items(2))), {})
+        self.assertEqual(calls, [2])
+
+    def test_unattempted_items_are_not_remembered(self):
+        calls = []
+
+        def nothing_sent(its):
+            calls.append([i.id for i in its])
+            res = llm.LLMResults()
+            res.unattempted.update(i.id for i in its)
+            return res
+
+        memo = llm.MemoizedLLM(nothing_sent)
+        first = memo(items(2))
+        memo(items(2))
+        self.assertEqual(len(calls), 2)                           # asked again: it was never really tried
+        self.assertEqual(first.unattempted, {"r49q1", "r49q2"})
+
+    def test_exceptions_propagate_and_are_not_remembered(self):
+        state = {"n": 0}
+
+        def flaky(its):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("down")
+            return {i.id: llm.LLMAnswer("C", "llm:m1") for i in its}
+
+        memo = llm.MemoizedLLM(flaky)
+        with self.assertRaises(RuntimeError):
+            memo(items(1))
+        self.assertEqual(memo(items(1))["r49q1"].letter, "C")
+
+    def test_make_llm_fn_shares_one_budget_and_memo(self):
+        fake = FakeModels({"m1": lambda b: reply({"r49q%d" % i: "A" for i in range(1, 6)})})
+        client = llm.make_llm_fn(token="tok", models=["m1"], max_requests=2)
+        with mock.patch("quizbot.llm._http_json", fake):
+            client(items(3))
+            client(items(3))                                      # memo: no request
+            client(items(5))                                      # 2 new questions: one more request
+            client(items(5, prefix="r50q"))                       # new ids, same questions: memo
+        self.assertEqual(len(fake.requests), 2)
+        self.assertEqual(client.budget.used, 2)
+        self.assertEqual(client.budget.cap, 2)
+
+
+class SelfTestTest(unittest.TestCase):
+    def run_selftest(self, llm_fn=None, **kw):
+        lines = []
+        rc = llm.selftest(llm_fn, out=lines.append, **kw)
+        return rc, "\n".join(lines)
+
+    @staticmethod
+    def answers(letters, method="llm:m1", models=("m1",)):
+        def fn(its):
+            return {i.id: llm.LLMAnswer(letter, method, "m1->%s" % letter, models)
+                    for i, letter in zip(its, letters) if letter}
+        return fn
+
+    def test_the_expected_answers_are_actually_right(self):
+        from decimal import Decimal
+
+        def value(text):
+            return Decimal(text.replace("$", "").replace(",", ""))
+
+        q1, q2, q3 = llm.SELFTEST_CASES
+        self.assertEqual(value(q1[1][q1[2]]), 17 + 25)
+        self.assertEqual(value(q2[1][q2[2]]), Decimal("0.15") * 240)
+        self.assertEqual(value(q3[1][q3[2]]), Decimal(10000) * Decimal("0.06") * 3)
+        for text, options, want in llm.SELFTEST_CASES:
+            self.assertEqual(sorted(options), ["A", "B", "C", "D"])
+            self.assertEqual(len({v for v in options.values()}), 4)
+            self.assertIn(want, "ABCD")
+        self.assertGreater(len({want for _t, _o, want in llm.SELFTEST_CASES}), 1)    # not all the same letter
+        self.assertIn("simple interest", q3[0])
+        self.assertIn("%", q2[0])
+
+    def test_all_correct_exits_0_and_reports_models_latency_and_per_question_result(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+        clock = iter([100.0, 103.5]).__next__
+        rc, text = self.run_selftest(self.answers(want, "llm:openai/gpt-4.1", ("openai/gpt-4.1", "openai/o3")), clock=clock)
+        self.assertEqual(rc, 0)
+        self.assertEqual(text.count("[PASS]"), 3)
+        self.assertNotIn("[FAIL]", text)
+        self.assertIn("via llm:openai/gpt-4.1", text)
+        self.assertIn("models that answered: openai/gpt-4.1, openai/o3", text)
+        self.assertIn("latency: 3.5 s", text)
+        self.assertIn("correct: 3/3", text)
+        self.assertIn("simple interest", text)
+
+    def test_two_of_three_correct_passes(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+        wrong = [w for w in "ABCD" if w != want[2]][0]
+        rc, text = self.run_selftest(self.answers([want[0], want[1], wrong]))
+        self.assertEqual(rc, 0)
+        self.assertEqual((text.count("[PASS]"), text.count("[FAIL]")), (2, 1))
+
+    def test_one_of_three_correct_fails_with_exit_1(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+        wrong = lambda w: [x for x in "ABCD" if x != w][0]
+        rc, text = self.run_selftest(self.answers([want[0], wrong(want[1]), wrong(want[2])]))
+        self.assertEqual(rc, 1)
+        self.assertIn("correct: 1/3", text)
+
+    def test_a_missing_answer_counts_as_wrong(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+        rc, text = self.run_selftest(self.answers([want[0], None, None]))
+        self.assertEqual(rc, 1)
+        self.assertIn("[MISS]", text)
+
+    def test_unavailable_llm_exits_3(self):
+        rc, text = self.run_selftest(lambda its: {})               # the sandbox answers "OK": no usable reply
+        self.assertEqual(rc, 3)
+        self.assertIn("unavailable", text)
+        rc, _ = self.run_selftest(lambda its: None)
+        self.assertEqual(rc, 3)
+
+        def boom(its):
+            raise RuntimeError("network")
+
+        rc, text = self.run_selftest(boom)
+        self.assertEqual(rc, 3)
+        self.assertIn("RuntimeError", text)
+
+    def test_no_token_exits_3_without_any_request(self):
+        fake = FakeModels({})
+        with mock.patch("quizbot.llm.get_token", return_value=None), mock.patch("quizbot.llm._http_json", fake):
+            rc, text = self.run_selftest()
+        self.assertEqual(rc, 3)
+        self.assertIn("no GITHUB_TOKEN", text)
+        self.assertEqual(fake.requests, [])
+
+    def test_real_path_with_fake_http_lists_requests_and_models(self):
+        want = {"selftest%d" % n: c[2] for n, c in enumerate(llm.SELFTEST_CASES, 1)}
+        models = llm.preferred_models({})
+        fake = FakeModels({m: (lambda b: reply(want)) for m in models})
+        with mock.patch("quizbot.llm._http_json", fake), mock.patch.dict(os.environ, {"QUIZ_LLM_MODELS": ""}):
+            rc, text = self.run_selftest(token="tok")
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.models_used(), models[:2])           # first opinion + one second opinion
+        self.assertIn("request to %s" % models[0], text)
+        self.assertIn("request to %s" % models[1], text)
+        self.assertIn("models that answered: %s, %s" % (models[0], models[1]), text)
+        self.assertIn("via llm:%s" % models[0], text)
+        sent = fake.requests[0]["messages"][1]["content"]
+        for text_q, _o, _w in llm.SELFTEST_CASES:
+            self.assertIn(text_q, sent)
+
+    def test_real_path_when_the_endpoint_returns_ok_is_unavailable(self):
+        # what the local sandbox does: every call "succeeds" with a body that is not JSON
+        def ok_body(method, url, headers, body=None, timeout=60):
+            raise llm.LLMRequestError(-1, "response is not JSON: OK")
+
+        with mock.patch("quizbot.llm._http_json", ok_body):
+            rc, text = self.run_selftest(token="tok")
+        self.assertEqual(rc, 3)
+        self.assertIn("unavailable", text)
+
+    def test_solver_status_is_shown_but_does_not_affect_the_result(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+        solver = lambda text, options: Sol(None, "abstain:unmatched", "")
+        rc, text = self.run_selftest(self.answers(want), solver=solver)
+        self.assertEqual(rc, 0)
+        self.assertIn("rule solver: abstains (abstain:unmatched)", text)
+        rc, text = self.run_selftest(self.answers(want), solver=lambda t, o: Sol("A", "rule:x", ""))
+        self.assertIn("rule solver: answers A", text)
+
+        def broken(text, options):
+            raise ValueError("x")
+
+        rc, text = self.run_selftest(self.answers(want), solver=broken)
+        self.assertEqual(rc, 0)
+        self.assertIn("rule solver raised ValueError", text)
+
+
 # ==========================================================================
 # gitops
 # ==========================================================================
@@ -1237,6 +2069,163 @@ class GitFlowTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TwoPhaseFlowTest(unittest.TestCase):
+    """Finding 2 in gitops: rule answers are pushed first, the LLM upgrade pass is a second commit."""
+
+    def flow(self, handler=None, env=None, llm_pass=True, phase1=None, phase2=None, issues=None):
+        events = []
+        sleeps = []
+
+        def record(args):
+            events.append(" ".join(args))
+            return handler(args) if handler else (0, "", "")
+
+        runner = FakeRunner(record)
+
+        def pipeline_fn():
+            events.append("PASS1")
+            return phase1() if phase1 else fake_result(new=[49])
+
+        def llm_pass_fn(first):
+            events.append("PASS2")
+            llm_pass_fn.seen.append(first)
+            return phase2() if phase2 else fake_result(updated=[49])
+
+        llm_pass_fn.seen = []
+
+        def notify(root, rounds, env, request=None):
+            events.append("ISSUES")
+            return []
+
+        with mock.patch.object(gitops, "notify_issues", notify if issues is None else issues):
+            rc = gitops.run_git_flow(pipeline_fn, root="/repo", env=env if env is not None else {"QUIZBOT_ALLOW_RESET": "1"},
+                                     runner=runner, sleep=sleeps.append,
+                                     llm_pass_fn=llm_pass_fn if llm_pass else None)
+        return rc, events, sleeps, llm_pass_fn
+
+    @staticmethod
+    def dirty(args):
+        if args[:2] == ["status", "--porcelain"]:
+            return 0, " M answers/round-0049.json\n", ""
+        return 0, "", ""
+
+    @staticmethod
+    def commits(events):
+        return [e.split(" -m ")[-1] for e in events if " commit " in " " + e + " " and "-m" in e]
+
+    def test_rules_are_pushed_before_the_llm_pass_starts(self):
+        rc, events, sleeps, _ = self.flow(self.dirty)
+        self.assertEqual(rc, 0)
+        first_push = events.index("push origin HEAD:main")
+        second_push = len(events) - 1 - events[::-1].index("push origin HEAD:main")
+        self.assertLess(events.index("PASS1"), first_push)
+        self.assertLess(first_push, events.index("PASS2"))
+        self.assertLess(events.index("PASS2"), second_push)
+        self.assertNotEqual(first_push, second_push)
+        self.assertEqual(sleeps, [])
+
+    def test_two_commits_answer_then_update(self):
+        rc, events, _, _ = self.flow(self.dirty)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.commits(events), ["Answer round 49", "Update round 49"])
+
+    def test_llm_pass_receives_the_first_result_and_does_not_resync_on_its_first_attempt(self):
+        rc, events, _, llm_pass = self.flow(self.dirty)
+        self.assertEqual(events.count("reset --hard origin/main"), 1)         # phase 1 only
+        self.assertEqual(events.count("fetch origin main"), 1)
+        self.assertEqual(len(llm_pass.seen), 1)
+        self.assertEqual(llm_pass.seen[0].new_rounds, [49])
+
+    def test_issues_wait_for_the_llm_pass(self):
+        _, events, _, _ = self.flow(self.dirty)
+        self.assertEqual(events.count("ISSUES"), 1)
+        self.assertGreater(events.index("ISSUES"), events.index("PASS2"))
+        _, events, _, _ = self.flow(self.dirty, llm_pass=False)               # no LLM pass: opened in phase 1
+        self.assertEqual(events.count("ISSUES"), 1)
+        self.assertLess(events.index("ISSUES"), events.index("push origin HEAD:main"))
+
+    def test_phase_one_failure_skips_the_llm_pass(self):
+        def handler(args):
+            return (1, "", "rejected") if args[0] == "push" else self.dirty(args)
+
+        rc, events, sleeps, llm_pass = self.flow(handler)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("PASS2", events)
+        self.assertEqual(sleeps, [5, 10, 20, 30])
+
+    def test_source_error_in_phase_one_skips_the_llm_pass(self):
+        def broken():
+            raise source.SourceError("no questions")
+
+        rc, events, _, _ = self.flow(self.dirty, phase1=broken)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("PASS2", events)
+
+    def test_rejected_llm_push_resyncs_and_reruns_only_the_llm_pass(self):
+        pushes = []
+
+        def handler(args):
+            if args[0] == "push":
+                pushes.append(1)
+                return (1, "", "! [rejected]") if len(pushes) == 2 else (0, "", "")
+            return self.dirty(args)
+
+        rc, events, sleeps, llm_pass = self.flow(handler)
+        self.assertEqual(rc, 0)
+        self.assertEqual(events.count("PASS1"), 1)
+        self.assertEqual(events.count("PASS2"), 2)
+        self.assertEqual(events.count("reset --hard origin/main"), 2)         # phase 1, then the phase-2 retry
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(self.commits(events), ["Answer round 49", "Update round 49", "Update round 49"])
+        self.assertEqual(llm_pass.seen[0], llm_pass.seen[1])                  # same phase-1 result both times
+
+    def test_llm_push_gives_up_after_five_attempts_but_phase_one_stays_pushed(self):
+        pushes = []
+
+        def handler(args):
+            if args[0] == "push":
+                pushes.append(1)
+                return (0, "", "") if len(pushes) == 1 else (1, "", "rejected")
+            return self.dirty(args)
+
+        rc, events, sleeps, _ = self.flow(handler)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(pushes), 6)                                      # 1 for phase 1 + 5 for phase 2
+        self.assertEqual(events.count("PASS1"), 1)
+        self.assertEqual(sleeps, [5, 10, 20, 30])
+
+    def test_a_crash_in_the_llm_pass_is_reported_but_phase_one_is_already_pushed(self):
+        def crash():
+            raise RuntimeError("bug in the upgrade pass")
+
+        rc, events, _, _ = self.flow(self.dirty, phase2=crash)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.commits(events), ["Answer round 49"])
+        self.assertEqual(events.count("push origin HEAD:main"), 1)
+
+    def test_clean_tree_after_both_passes_pushes_nothing(self):
+        rc, events, _, _ = self.flow(None)                                    # status always clean
+        self.assertEqual(rc, 0)
+        self.assertEqual(events.count("PASS2"), 1)
+        self.assertFalse(any(e.startswith(("commit", "push", "add")) for e in events))
+
+    def test_state_only_llm_bookkeeping_is_committed_as_a_state_update(self):
+        result = pipeline.PipelineResult(results=[pipeline.RoundResult(49, "upgrade", state_changed=True)], state={}, rounds={})
+        rc, events, _, _ = self.flow(self.dirty, phase1=lambda: fake_result(), phase2=lambda: result)
+        self.assertEqual(self.commits(events)[-1], "Update quiz state")
+
+    def test_improved_round_with_unchanged_letters_is_named_in_the_commit(self):
+        result = pipeline.PipelineResult(results=[pipeline.RoundResult(
+            49, "upgrade", state_changed=True, changed_questions=[24, 25])], state={}, rounds={})
+        self.assertEqual(result.updated_rounds, [49])
+        rc, events, _, _ = self.flow(self.dirty, phase2=lambda: result)
+        self.assertEqual(self.commits(events)[-1], "Update round 49")
+
+    def test_skipped_rounds_are_never_listed_as_updated(self):
+        result = pipeline.PipelineResult(results=[pipeline.RoundResult(49, "skip", "not released yet")], state={}, rounds={})
+        self.assertEqual((result.updated_rounds, result.new_rounds, result.changed), ([], [], False))
+
+
 class IssueNotificationTest(TempRootTest):
     ENV = {"GITHUB_ACTIONS": "true", "GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": "me/DSO429HW3"}
 
@@ -1373,6 +2362,176 @@ class GitEndToEndTest(TempRootTest):
             self.assertEqual(self.git(bare, "rev-list", "--count", "main").strip(), commits_before)
 
 
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class TwoPhaseGitTest(TempRootTest):
+    """`run.py --git` against a real local bare repo: rule answers land on the remote BEFORE the LLM is asked."""
+
+    GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+               "QUIZBOT_ALLOW_RESET": "1"}
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git"] + list(args), cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, self.GIT_ENV)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("GITHUB_ACTIONS", "GITHUB_TOKEN", "GH_TOKEN"):
+            os.environ.pop(key, None)
+        self.bare = os.path.join(self.root, "remote.git")
+        seed = os.path.join(self.root, "seed")
+        self.work = os.path.join(self.root, "work")
+        self.rival = os.path.join(self.root, "rival")
+        self.git(self.root, "init", "--bare", self.bare)
+        self.git(self.bare, "symbolic-ref", "HEAD", "refs/heads/main")
+        self.git(self.root, "clone", self.bare, seed)
+        self.git(seed, "checkout", "-b", "main")
+        with open(os.path.join(seed, ".gitignore"), "w") as fh:
+            fh.write("__pycache__/\n")
+        self.git(seed, "add", ".gitignore")
+        self.git(seed, "commit", "-m", "init")
+        self.git(seed, "push", "origin", "main")
+        self.git(self.root, "clone", self.bare, self.work)
+        self.git(self.root, "clone", self.bare, self.rival)
+        self.csv = os.path.join(self.root, "q.csv")
+        texts = ["RULE C q%d" % i for i in range(1, 21)] + ["HARD D q%d" % i for i in range(21, 26)]
+        with open(self.csv, "w", encoding="utf-8", newline="") as fh:
+            fh.write(make_csv([csv_line(49, i, "2026-10-17T21:00:00Z", t) for i, t in enumerate(texts, 1)]))
+        patcher = mock.patch.object(gitops, "BACKOFFS", (0, 0, 0, 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def remote_log(self):
+        return self.git(self.bare, "log", "--format=%s", "main").splitlines()
+
+    def remote_answers(self, rid=49):
+        return json.loads(self.git(self.bare, "show", "main:answers/round-%04d.json" % rid))["answers"]
+
+    def remote_state(self):
+        return json.loads(self.git(self.bare, "show", "main:state/rounds.json"))
+
+    def main(self, llm_fn, now="2026-10-17T21:05:00Z", extra=()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            return run_module.main(["--git", "--questions-file", self.csv, "--now", now] + list(extra),
+                                   root=self.work, solver=self.solver, llm_fn=llm_fn)
+
+    def llm_says(self, letter, spy=None):
+        def fn(its):
+            if spy is not None:
+                spy(its)
+            return {i.id: llm.LLMAnswer(letter, "llm:m1", "asked") for i in its}
+        return fn
+
+    def test_rule_answers_are_on_the_remote_before_the_llm_is_asked(self):
+        seen = {}
+
+        def spy(its):
+            seen["log"] = self.remote_log()
+            seen["answers"] = self.remote_answers()
+            seen["methods"] = self.remote_state()["49"]["methods"]
+            seen["ids"] = [i.id for i in its]
+
+        rc = self.main(self.llm_says("B", spy))
+        self.assertEqual(rc, 0)
+        # what the remote held at the moment the LLM was called
+        self.assertEqual(seen["log"], ["Answer round 49", "init"])
+        self.assertEqual([seen["answers"]["q%d" % i] for i in (1, 20)], ["C", "C"])
+        self.assertEqual([seen["answers"]["q%d" % i] for i in range(21, 26)], ["A"] * 5)       # guess placeholders
+        self.assertEqual({seen["methods"]["q%d" % i] for i in range(21, 26)}, {"guess"})
+        self.assertEqual(seen["ids"], ["r49q%d" % i for i in range(21, 26)])
+        # and afterwards
+        self.assertEqual(self.remote_log(), ["Update round 49", "Answer round 49", "init"])
+        self.assertEqual([self.remote_answers()["q%d" % i] for i in (20, 21, 25)], ["C", "B", "B"])
+        self.assertEqual(self.remote_state()["49"]["methods"]["q25"], "llm:m1")
+        self.assertEqual(self.git(self.work, "status", "--porcelain").strip(), "")
+
+    def test_a_slow_or_failing_llm_cannot_prevent_the_rule_push(self):
+        def boom(its):
+            raise RuntimeError("models.github.ai is down")
+
+        rc = self.main(boom)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.remote_log()[-2], "Answer round 49")
+        self.assertEqual([self.remote_answers()["q%d" % i] for i in (1, 20, 21)], ["C", "C", "A"])
+
+    def test_push_race_during_the_llm_pass_does_not_ask_the_llm_twice(self):
+        calls = []
+
+        def rival_pushes_while_we_think(its):
+            calls.append([i.id for i in its])
+            self.git(self.rival, "pull", "-q", "origin", "main")
+            with open(os.path.join(self.rival, "NOTES.txt"), "w") as fh:
+                fh.write("rival\n")
+            self.git(self.rival, "add", "NOTES.txt")
+            self.git(self.rival, "commit", "-m", "rival commit")
+            self.git(self.rival, "push", "-q", "origin", "main")
+
+        rc = self.main(self.llm_says("D", rival_pushes_while_we_think))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)                                          # memoised across the retry
+        self.assertEqual(self.remote_log(), ["Update round 49", "rival commit", "Answer round 49", "init"])
+        self.assertEqual(self.remote_answers()["q25"], "D")
+
+    def test_late_round_still_gets_its_llm_upgrade(self):
+        rc = self.main(self.llm_says("C"), now="2026-10-18T02:00:00Z")           # 5 h after release
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.remote_log(), ["Update round 49", "Answer round 49", "init"])
+        self.assertEqual(self.remote_answers()["q23"], "C")
+        # but the next process leaves the (now locked) round alone
+        before = self.remote_log()
+        self.assertEqual(self.main(self.llm_says("A"), now="2026-10-18T02:05:00Z"), 0)
+        self.assertEqual(self.remote_log(), before)
+
+    def test_all_rule_round_is_a_single_commit_and_never_calls_the_llm(self):
+        with open(self.csv, "w", encoding="utf-8", newline="") as fh:
+            fh.write(make_csv([csv_line(49, i, "2026-10-17T21:00:00Z", "RULE B q%d" % i) for i in range(1, 26)]))
+        spy = mock.Mock(return_value={})
+        self.assertEqual(self.main(spy), 0)
+        spy.assert_not_called()
+        self.assertEqual(self.remote_log(), ["Answer round 49", "init"])
+
+    def test_second_process_is_a_noop_and_does_not_reask_a_working_llm(self):
+        calls = []
+        self.assertEqual(self.main(self.llm_says("B", calls.append)), 0)
+        log_after_first = self.remote_log()
+        self.assertEqual(self.main(self.llm_says("B", calls.append), now="2026-10-17T21:07:00Z"), 0)
+        self.assertEqual(self.remote_log(), log_after_first)
+        self.assertEqual(len(calls), 1)
+
+    def test_throttled_llm_failure_is_recorded_once_and_not_hammered(self):
+        calls = []
+
+        def nothing(its):
+            calls.append(1)
+            return {}
+
+        self.assertEqual(self.main(nothing), 0)
+        self.assertEqual(self.remote_log(), ["Update quiz state", "Answer round 49", "init"])   # attempt times recorded
+        self.assertIn("llm_attempted_at", self.remote_state()["49"])
+        for minute in ("21:06", "21:20", "21:34"):                                  # all < 30 min after 21:05
+            self.assertEqual(self.main(nothing, now="2026-10-17T%s:00Z" % minute), 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.remote_log()), 3)
+        self.assertEqual(self.main(nothing, now="2026-10-17T21:36:00Z"), 0)         # 31 min later: asked again
+        self.assertEqual(len(calls), 2)
+
+    def test_no_llm_flag_is_a_single_phase(self):
+        spy = mock.Mock(return_value={})
+        rc = self.main(spy, extra=["--no-llm"])
+        self.assertEqual(rc, 0)
+        spy.assert_not_called()
+        self.assertEqual(self.remote_log(), ["Answer round 49", "init"])
+
+    def test_future_round_is_not_pushed(self):
+        rc = self.main(self.llm_says("B"), now="2026-10-17T20:00:00Z")           # an hour before release
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.remote_log(), ["init"])
+        self.assertEqual(self.git(self.work, "status", "--porcelain").strip(), "")
+
+
 # ==========================================================================
 # run.py
 # ==========================================================================
@@ -1466,6 +2625,49 @@ class CliTest(TempRootTest):
         rc, out = self._check(abstainer)
         self.assertEqual(rc, 1)
         self.assertIn("abstained", out)
+
+    # ---- --llm-selftest -----------------------------------------------------
+    def test_llm_selftest_exit_codes_and_no_files_written(self):
+        want = [c[2] for c in llm.SELFTEST_CASES]
+
+        def llm_fn(letters):
+            return lambda its: {i.id: llm.LLMAnswer(l, "llm:m1", "m1->%s" % l, ("m1",)) for i, l in zip(its, letters)}
+
+        rc, out = self.main(["--llm-selftest"], llm_fn=llm_fn(want))
+        self.assertEqual(rc, 0)
+        self.assertIn("models that answered: m1", out)
+        self.assertIn("latency:", out)
+        self.assertEqual(out.count("[PASS]"), 3)
+        wrong = ["A" if w != "A" else "B" for w in want]
+        rc, out = self.main(["--llm-selftest"], llm_fn=llm_fn(wrong))
+        self.assertEqual(rc, 1)
+        rc, out = self.main(["--llm-selftest"], llm_fn=lambda its: {})
+        self.assertEqual(rc, 3)
+        self.assertEqual(os.listdir(self.root), [])               # no answers/, state/ or STATUS.md anywhere
+
+    def test_llm_selftest_never_touches_the_pipeline_or_git(self):
+        runner = FakeRunner()
+        with mock.patch("quizbot.pipeline.run_pipeline", side_effect=AssertionError("pipeline ran")), \
+                mock.patch("quizbot.source.load_rounds", side_effect=AssertionError("fetched questions")):
+            rc, _ = self.main(["--llm-selftest"], llm_fn=lambda its: {}, runner=runner)
+        self.assertEqual(rc, 3)
+        self.assertEqual(runner.calls, [])
+
+    def test_llm_selftest_without_a_token_is_unavailable(self):
+        with mock.patch("quizbot.llm.get_token", return_value=None), \
+                mock.patch("quizbot.llm._http_json", side_effect=AssertionError("must not call out")):
+            rc, out = self.main(["--llm-selftest"])
+        self.assertEqual(rc, 3)
+        self.assertIn("unavailable", out)
+
+    def test_llm_selftest_cannot_be_combined_with_other_modes(self):
+        for extra in ("--no-llm", "--git", "--dry-run", "--check-practice"):
+            self.assertEqual(self.main(["--llm-selftest", extra])[0], 2, extra)
+
+    def test_llm_selftest_shows_the_rule_solvers_view(self):
+        rc, out = self.main(["--llm-selftest"], llm_fn=lambda its: {})
+        rc, out = self.main(["--llm-selftest"], llm_fn=lambda its: {i.id: llm.LLMAnswer("A", "llm:m", "") for i in its})
+        self.assertIn("rule solver: abstains", out)               # FakeSolver knows none of the 3 synthetic questions
 
     def _check(self, solver):
         out = io.StringIO()

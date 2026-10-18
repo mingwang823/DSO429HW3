@@ -47,16 +47,64 @@ def normalize_text(text: str) -> str:
 NUM = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 #: A non-negative integer (thousands separators allowed).
 INT = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
-#: Generic subject noun phrase: "A product line", "The retailer" ...
-SUBJ = r"(?:an?|the) [a-z][a-z0-9\-' ]{0,50}?"
+#: Words that may never appear inside a "subject" or other free noun phrase.  They are
+#: prepositions / conjunctions (a clause such as "after a fee", "excluding returns", "of
+#: 100 tickets"), quantifiers, financial qualifiers that change what a figure means, and
+#: the verbs the family grammars use to end a subject.  A phrase containing one of them
+#: simply does not match, so the question is left to the fallback.
+_STOP_WORDS = (
+    "after before during until since of for with without within across over under between "
+    "among in on at by from to into onto as than then and or but if when while whereas per "
+    "each every all both any no not only either neither "
+    "excluding including excludes includes minus plus less except net gross pretax "
+    "pre-tax aftertax after-tax adjusted tax taxes taxed fee fees returns returned "
+    "refund refunds refunded discount discounted reduced "
+    "is are was were be been has have had holds contains generates generated sells sold "
+    "listed priced marked costing"
+)
+_STOP_RE = "|".join(sorted(set(_STOP_WORDS.split()), key=len, reverse=True))
+#: Spelled-out numbers ("fifty-ticket queue", "a dozen items") hide a stated quantity just
+#: like digits do, so a word that *starts* with one is not a plain noun either.
+_NUM_WORDS = (
+    "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    "fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    "eighty|ninety|hundred|thousand|million|billion|dozen|half|double|triple|single"
+)
+#: Selector adjectives that point at a *subset* or a derived figure ("the remaining
+#: stores", "the largest line").  Not allowed in a plain subject noun phrase.
+_SELECTORS = (
+    "other|others|remaining|rest|additional|further|extra|combined|overall|median|largest|"
+    "smallest|biggest|negative|positive|twice|last|next|previous"
+)
+_NOT_PLAIN = rf"(?!(?:{_STOP_RE}|{_SELECTORS})(?![a-z0-9\-'])|(?:{_NUM_WORDS})(?![a-z]))"
+#: One plain lower-case word (letters, hyphen, apostrophe; no digits, no stop word).
+WORD = rf"{_NOT_PLAIN}[a-z][a-z\-']*"
+#: Like ``WORD`` but may contain / start with digits ("Region 3", "Q3").  Group labels
+#: and recipient lists (``two channels``) use this one, so number words are allowed there.
+WORD_D = rf"(?!(?:{_STOP_RE})(?![a-z0-9\-']))[a-z0-9][a-z0-9\-']*"
+
+
+def phrase(max_extra: int = 3) -> str:
+    """A short digit-free noun phrase of 1..max_extra+1 words without stop words."""
+    return rf"{WORD}(?: {WORD}){{0,{max_extra}}}"
+
+
+#: Generic subject noun phrase: "A product line", "The retailer" ...  Digit-free, at most
+#: four words, no prepositions / qualifiers (so "A support queue of 100 tickets" and
+#: "A product line adjusted for inflation" do NOT match).
+SUBJ = rf"(?:an?|the) {phrase(3)}"
+
+#: Currency symbols the money grammars accept in front of an amount.
+MONEY_SYMBOLS = "$€£"
 
 
 def money_g(name: str) -> str:
-    return rf"\$(?P<{name}>{NUM})"
+    """An amount with a currency symbol; groups ``<name>_c`` (symbol) and ``<name>``."""
+    return rf"(?P<{name}_c>[$€£])(?P<{name}>{NUM})"
 
 
 def pct_g(name: str) -> str:
-    return rf"(?P<{name}>{NUM}) ?%"
+    return rf"(?P<{name}>{NUM})(?: ?%| percent| per cent)"
 
 
 def num_g(name: str) -> str:
@@ -255,6 +303,9 @@ _RE_MONEY_SYM = re.compile(
 _RE_MONEY_SUFFIX = re.compile(
     rf"(?P<s1>[-+])? *(?P<num>{_ON}) *(?P<cur>[a-z][a-z. ]*)", re.I | re.A
 )
+_RE_MONEY_CODE_PREFIX = re.compile(
+    rf"(?P<code>[a-z]{{3}}) *(?P<s1>[-+])? *(?P<num>{_ON})", re.I | re.A
+)
 _RE_PERCENT = re.compile(
     rf"(?P<s1>[-+])? *(?P<num>{_ON}) *(?:%|percent|per cent|pct\.?)", re.I | re.A
 )
@@ -316,6 +367,15 @@ def parse_option(raw: str) -> OptionValue:
         if v is None:
             return text
         return OptionValue("money", v, count_decimals(m.group("num")), cur, raw)
+
+    m = _RE_MONEY_CODE_PREFIX.fullmatch(body)
+    if m:
+        iso = m.group("code").upper()
+        if iso in CURRENCY_NAMES.values():
+            v = _signed([m.group("s1")], m.group("num"), negate)
+            if v is None:
+                return text
+            return OptionValue("money", v, count_decimals(m.group("num")), iso, raw)
 
     m = _RE_PERCENT.fullmatch(body)
     if m:

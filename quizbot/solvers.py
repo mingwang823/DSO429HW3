@@ -18,7 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, localcontext
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 from typing import Callable
 
@@ -31,11 +31,14 @@ from .parsing import (
     MAX_TEXT_LEN,
     NUM,
     SUBJ,
+    WORD,
+    WORD_D,
     currency_code,
     money_g,
     normalize_text,
     parse_date_ex,
     pct_g,
+    phrase,
     to_decimal,
 )
 
@@ -83,6 +86,21 @@ def _fraction(d: Decimal) -> Fraction:
     return Fraction(d)
 
 
+_SYM_ISO = {"$": "USD", "€": "EUR", "£": "GBP"}
+
+
+def _cur(m: re.Match[str], *names: str) -> str:
+    """ISO code of the currency symbol(s) in front of the named ``money_g`` groups.
+
+    All named amounts that took part in the match must use the same symbol; mixed
+    symbols ("$100 ... €50") are not safe to combine, so abstain."""
+    gd = m.groupdict()
+    syms = {gd[f"{n}_c"] for n in names if gd.get(f"{n}_c")}
+    if len(syms) != 1:
+        raise Abstain("mixed_currency", "amounts use different currency symbols")
+    return _SYM_ISO[next(iter(syms))]
+
+
 def _names_for_group(m: re.Match[str], *names: str) -> str | None:
     for n in names:
         v = m.groupdict().get(n)
@@ -96,18 +114,27 @@ def _names_for_group(m: re.Match[str], *names: str) -> str | None:
 # --------------------------------------------------------------------------
 
 _FREQ_M: dict[str, int | None] = {
-    "annually": 1, "yearly": 1, "semiannually": 2, "quarterly": 4, "monthly": 12,
-    "weekly": 52, "daily": 365, "continuously": None,
+    "annually": 1, "yearly": 1, "everyyear": 1,
+    "semiannually": 2, "twiceayear": 2, "twiceyearly": 2, "halfyearly": 2, "everysixmonths": 2,
+    "quarterly": 4, "everyquarter": 4, "monthly": 12, "everymonth": 12,
+    "weekly": 52, "everyweek": 52, "daily": 365, "everyday": 365, "continuously": None,
 }
+# note: "bi-annually" / "biannually" is deliberately absent (twice a year OR every 2 years)
 _FREQ = (
-    r"(?P<freq>annually|yearly|semi-?annually|semi annually|quarterly|monthly|weekly"
-    r"|daily|continuously)"
+    r"(?P<freq>annually|yearly|every year|semi-?annually|semi annually|twice a year"
+    r"|twice yearly|half-yearly|every six months|quarterly|every quarter|monthly"
+    r"|every month|weekly|every week|daily|every day|continuously)"
 )
 _TIME = rf"(?P<t>{NUM}) (?P<tu>years?|months?)"
 _RATE_PHRASE = r"(?:an? (?:annual |yearly )?(?:interest )?rate of )?"
-_PER_YEAR = r"(?: per (?:year|annum)| a year| annually)?"
+_PER_YEAR = r"(?: per (?:year|annum)| a year| annually| p\.a\.)?"
+# Only adjectives that clearly mean a one-off lump sum.  A free adjective slot let
+# "a monthly / annual / recurring deposit of $500" (an annuity) through as a lump sum.
+_INV_ADJ = (
+    r"(?:initial |opening |starting |original |one-time |lump-sum |lump sum |savings |bank )?"
+)
 _LEAD_INV = (
-    rf"(?:an?|the) (?:[a-z]+ )?(?:investment|deposit|principal|balance|account) "
+    rf"(?:an?|the) {_INV_ADJ}(?:investment|deposit|principal|balance|account) "
     rf"(?:of|with) {money_g('p')}"
 )
 _CI_SENTENCES = [
@@ -115,6 +142,8 @@ _CI_SENTENCES = [
     rf"{_RATE_PHRASE}{pct_g('r')}(?: interest)?{_PER_YEAR},? (?:and is |and )?compounded {_FREQ}",
     rf"{money_g('p')} is (?:invested|deposited) at {_RATE_PHRASE}{pct_g('r')}"
     rf"(?: interest)?{_PER_YEAR},? (?:and is |and )?compounded {_FREQ}",
+    rf"{_LEAD_INV} (?:earns|accrues) {_RATE_PHRASE}{pct_g('r')} interest{_PER_YEAR},? "
+    rf"(?:and is |and )?compounded {_FREQ}",
 ]
 _SIMPLE_SENTENCES = [
     rf"{_LEAD_INV} (?:earns|grows at|accrues) {_RATE_PHRASE}{pct_g('r')}{_PER_YEAR} "
@@ -145,6 +174,7 @@ def _solve_compound(text: str) -> Computed | None:
     if m is None:
         return None
     principal = to_decimal(m["p"])
+    cur = _cur(m, "p")
     rate = to_decimal(m["r"]) / 100
     amount = _fraction(to_decimal(m["t"]))
     years = amount if m["tu"].lower().startswith("year") else amount / 12
@@ -166,22 +196,24 @@ def _solve_compound(text: str) -> Computed | None:
             fv = principal * (1 + rate / per_year) ** _fd(periods)
             how = f"compound m={per_year} {principal}*(1+{rate}/{per_year})^{_fd(periods):.6g}"
     if m["qi"] is not None:
-        return Computed(fv - principal, "money", "USD", f"interest earned, {how}")
-    return Computed(fv, "money", "USD", f"future value, {how}")
+        return Computed(fv - principal, "money", cur, f"interest earned, {how}")
+    return Computed(fv, "money", cur, f"future value, {how}")
 
 
 # --------------------------------------------------------------------------
 # 2. gross margin / gross profit / markup
 # --------------------------------------------------------------------------
 
+_REV = r"(?:revenue|sales)"
+_COGS = r"(?:cost of goods sold|cogs)"
 _GM_SENTENCES = [
-    rf"{SUBJ} generates {money_g('rev')} in revenue against {money_g('cogs')} in cost of goods sold",
-    rf"{SUBJ} generates {money_g('rev')} in revenue with {money_g('cogs')} in cost of goods sold",
-    rf"{SUBJ} (?:has|reports|records|posts) (?:a )?revenue of {money_g('rev')} and "
-    rf"(?:a )?cost of goods sold of {money_g('cogs')}",
-    rf"{SUBJ} with (?:a )?revenue of {money_g('rev')} and (?:a )?cost of goods sold of {money_g('cogs')}",
-    rf"{SUBJ} (?:has|reports|records) {money_g('rev')} in revenue and {money_g('cogs')} "
-    rf"in cost of goods sold",
+    rf"{SUBJ} generates {money_g('rev')} in {_REV} against {money_g('cogs')} in {_COGS}",
+    rf"{SUBJ} generates {money_g('rev')} in {_REV} with {money_g('cogs')} in {_COGS}",
+    rf"{SUBJ} (?:has|reports|records|posts) (?:a )?{_REV} of {money_g('rev')} and "
+    rf"(?:a )?{_COGS} of {money_g('cogs')}",
+    rf"{SUBJ} with (?:a )?{_REV} of {money_g('rev')} and (?:a )?{_COGS} of {money_g('cogs')}",
+    rf"{SUBJ} (?:has|reports|records) {money_g('rev')} in {_REV} and {money_g('cogs')} "
+    rf"in {_COGS}",
 ]
 _GM_Q = (
     r"what is (?:the|its) (?:(?P<gm>gross margin(?: percentage| percent)?"
@@ -197,8 +229,9 @@ def _solve_gross_margin(text: str) -> Computed | None:
     if m is None:
         return None
     rev, cogs = to_decimal(m["rev"]), to_decimal(m["cogs"])
+    cur = _cur(m, "rev", "cogs")
     if m["gp"] is not None:
-        return Computed(rev - cogs, "money", "USD", f"gross profit {rev}-{cogs}")
+        return Computed(rev - cogs, "money", cur, f"gross profit {rev}-{cogs}")
     if m["mk"] is not None:
         if cogs == 0:
             raise Abstain("zero_denominator", "markup with zero cost")
@@ -212,14 +245,14 @@ def _solve_gross_margin(text: str) -> Computed | None:
 # 3. next term of a sequence
 # --------------------------------------------------------------------------
 
-_SEQ_NUM = rf"-?{NUM}"
+_SEQ_NUM = rf"(?:-?\$?{NUM}|\$-{NUM})"
 _SEQ_RX = _rx(
     rf"{SUBJ} (?:series|sequence) (?:runs|goes|reads|is) "
     rf"(?P<nums>{_SEQ_NUM}(?:(?:, and |, | and ){_SEQ_NUM}){{2,29}})\. "
-    r"(?:if|assuming) (?:the|this) pattern (?:continues|holds), "
+    r"(?:if|assuming) (?:the|this) (?:pattern|trend) (?:continues|holds), "
     r"what (?:is the next (?:value|number|term|figure|item)|comes next)\?"
 )
-_SEQ_SPLIT = re.compile(r"(?:, and |, | and )(?=-?\d)")
+_SEQ_SPLIT = re.compile(r"(?:, and |, | and )(?=-?\$?-?\d)")
 
 
 def _predict_sequence(terms: list[Fraction]) -> set[Fraction]:
@@ -244,13 +277,18 @@ def _solve_sequence(text: str) -> Computed | None:
     if m is None:
         return None
     pieces = _SEQ_SPLIT.split(m["nums"])
-    terms = [_fraction(to_decimal(p)) for p in pieces]
+    dollars = {"$" in p for p in pieces}
+    if len(dollars) != 1:
+        raise Abstain("mixed_units", "some terms carry a $ and some do not")
+    terms = [_fraction(to_decimal(p.replace("$", ""))) for p in pieces]
     preds = _predict_sequence(terms)
     if not preds:
         raise Abstain("unknown_pattern", "not arithmetic, geometric or constant 2nd difference")
     if len(preds) > 1:
         raise Abstain("ambiguous_pattern", "several patterns fit with different next values")
     nxt = next(iter(preds))
+    if dollars.pop():
+        return Computed(_fd(nxt), "money", "USD", f"next term of {len(terms)}-term $ sequence")
     return Computed(_fd(nxt), "number", None, f"next term of {len(terms)}-term sequence")
 
 
@@ -297,15 +335,16 @@ def _solve_discount(text: str) -> Computed | None:
     if m is None:
         return None
     price = to_decimal(m["p"])
+    cur = _cur(m, "p")
     q_text = (m["qp"] or m["qs"] or "").lower()
     if kind == "markup":
-        if "discount" in q_text or "sav" in q_text:
+        if "discount" in q_text or "sav" in q_text or "reduced" in q_text or "markdown" in q_text:
             raise Abstain("inconsistent_question", "markup sentence with a discount question")
         rate = to_decimal(m["d"]) / 100
         final = price * (1 + rate)
         how = f"markup {price}*(1+{rate})"
     else:
-        if "markup" in q_text or "mark-up" in q_text:
+        if "markup" in q_text or "mark-up" in q_text or "marked" in q_text:
             raise Abstain("inconsistent_question", "discount sentence with a markup question")
         if kind == "successive":
             d1, d2 = to_decimal(m["d1"]) / 100, to_decimal(m["d2"]) / 100
@@ -321,21 +360,29 @@ def _solve_discount(text: str) -> Computed | None:
             how = f"discount {price}*(1-{d})"
     if m["qs"] is not None:
         amount = abs(price - final)
-        return Computed(amount, "money", "USD", f"amount, {how}")
-    return Computed(final, "money", "USD", f"price, {how}")
+        return Computed(amount, "money", cur, f"amount, {how}")
+    return Computed(final, "money", cur, f"price, {how}")
 
 
 # --------------------------------------------------------------------------
 # 5. percentage change
 # --------------------------------------------------------------------------
 
-_UP_VERBS = ("rose", "increased", "grew", "climbed", "jumped", "went up")
-_DOWN_VERBS = ("fell", "decreased", "dropped", "declined", "shrank", "went down")
+_UP_VERBS = ("rose", "increased", "grew", "climbed", "jumped", "went up",
+             "rises", "increases", "grows", "climbs", "jumps")
+_DOWN_VERBS = ("fell", "decreased", "dropped", "declined", "shrank", "went down",
+               "falls", "decreases", "drops", "declines", "shrinks")
+# Subject of the change: a short phrase.  Clause words (from / to / then / and / after /
+# excluding ...) are rejected, so "Revenue went from 100 to 200 then moved from ..." and
+# "Revenue after tax ..." are left alone; harmless prepositions are allowed.
+_PC_SUBJ = rf"(?:{WORD_D}|of|in|for|at|on)(?: (?:{WORD_D}|of|in|for|at|on)){{0,5}}"
 _PC_RX = _rx(
-    r"(?P<subj>[a-z][a-z0-9\-' ]{0,60}?) "
-    r"(?P<verb>moved|changed|rose|fell|increased|decreased|grew|dropped|climbed|declined"
-    r"|jumped|shrank|went up|went down) from "
-    rf"(?:\$(?P<a1>{NUM})|(?P<a2>{NUM})) to (?:\$(?P<b1>{NUM})|(?P<b2>{NUM}))\. "
+    rf"(?P<subj>{_PC_SUBJ}) "
+    r"(?P<verb>moved|changed|went|rose|fell|increased|decreased|grew|dropped|climbed|declined"
+    r"|jumped|shrank|went up|went down|rises|falls|increases|decreases|grows|drops|climbs"
+    r"|declines|jumps|shrinks) from "
+    rf"(?:(?P<sa>[$€£])(?P<a1>{NUM})|(?P<a2>{NUM})) to "
+    rf"(?:(?P<sb>[$€£])(?P<b1>{NUM})|(?P<b2>{NUM}))\. "
     r"what (?:is|was) the (?:percentage|percent) change\?"
 )
 
@@ -344,8 +391,8 @@ def _solve_percent_change(text: str) -> Computed | None:
     m = _PC_RX.fullmatch(text)
     if m is None:
         return None
-    if (m["a1"] is None) != (m["b1"] is None):
-        raise Abstain("mixed_units", "one amount has a $ sign and the other does not")
+    if (m["a1"] is None) != (m["b1"] is None) or m["sa"] != m["sb"]:
+        raise Abstain("mixed_units", "the two amounts do not carry the same currency symbol")
     a = to_decimal(m["a1"] or m["a2"])
     b = to_decimal(m["b1"] or m["b2"])
     if a == 0:
@@ -364,7 +411,7 @@ _SET_KIND = r"(?:business|working|calendar)"
 _SET_SENT = [
     rf"(?:an?) (?:contract|trade|agreement|invoice|order|lease|loan|deal|purchase) "
     rf"(?:signed|executed|made|placed|issued|opened|dated) on (?P<date>{DATE_RE}) "
-    rf"has an? (?P<n>\d+)-(?:(?P<k>business|working|calendar)-)?day settlement period",
+    rf"has an? (?P<n>\d+)[- ](?:(?P<k>business|working|calendar)[- ])?day settlement period",
     rf"(?:an?) (?:contract|trade|agreement|invoice|order|lease|loan|deal|purchase) "
     rf"(?:signed|executed|made|placed|issued|opened|dated) on (?P<date>{DATE_RE}) "
     rf"has a settlement period of (?P<n>\d+) (?:(?P<k>business|working|calendar) )?days?",
@@ -374,8 +421,8 @@ _SET_SENT = [
     rf"(?:signing|the signing date|being signed)",
 ]
 _SET_Q = (
-    r"(?:on what date does (?:it|the (?:contract|trade|agreement|invoice|order|lease|loan|deal"
-    r"|purchase)) settle|what date does it settle|when does it settle"
+    r"(?:on what date (?:does|will) (?:it|the (?:contract|trade|agreement|invoice|order|lease|loan"
+    r"|deal|purchase)) settle|what date (?:does|will) it settle|when (?:does|will) it settle"
     r"|what is the settlement date)\?"
 )
 _SET_RX = [_rx(rf"{s}\. {_SET_Q}") for s in _SET_SENT]
@@ -414,10 +461,15 @@ def _solve_settlement(text: str) -> Computed | None:
 # 7. break-even
 # --------------------------------------------------------------------------
 
+_BE_FIXED = rf"(?:the )?fixed costs (?:are|total|equal) {money_g('f')}\. "
 _BE_SENT = (
-    rf"(?:the )?fixed costs (?:are|total|equal) {money_g('f')}\. "
-    rf"each unit (?:sells|is sold) for {money_g('price')} (?:with|and has|and carries) "
-    rf"a variable cost of {money_g('v')}(?: per unit)?\. "
+    _BE_FIXED
+    + rf"each unit (?:sells|is sold) for {money_g('price')} (?:with|and has|and carries) "
+    + rf"a variable cost of {money_g('v')}(?: per unit)?\. "
+)
+_BE_SENT_CM = (
+    _BE_FIXED
+    + rf"each unit (?:has|carries|earns) a contribution margin of {money_g('cm')}(?: per unit)?\. "
 )
 _GOAL_BE = r"break even"
 _GOAL_TP = rf"(?:achieve|earn|reach|make|generate) a (?:target )?profit of {money_g('tp')}"
@@ -440,11 +492,12 @@ _BE_REV_TAILS = [
     r"what is the break-even point in terms of (?:sales )?revenue\?",
 ]
 _BE_RX: list[tuple[str, str, re.Pattern[str]]] = []
-for _goal_name, _goal in (("be", _GOAL_BE), ("tp", _GOAL_TP)):
-    for _tail, _mode in _BE_UNIT_TAILS:
-        _BE_RX.append((_goal_name, _mode, _rx(_BE_SENT + _tail.replace("{G}", _goal))))
-for _tail in _BE_REV_TAILS:
-    _BE_RX.append(("be", "revenue", _rx(_BE_SENT + _tail)))
+for _head in (_BE_SENT, _BE_SENT_CM):
+    for _goal_name, _goal in (("be", _GOAL_BE), ("tp", _GOAL_TP)):
+        for _tail, _mode in _BE_UNIT_TAILS:
+            _BE_RX.append((_goal_name, _mode, _rx(_head + _tail.replace("{G}", _goal))))
+    for _tail in _BE_REV_TAILS:
+        _BE_RX.append(("be", "revenue", _rx(_head + _tail)))
 
 
 def _solve_break_even(text: str) -> Computed | None:
@@ -456,22 +509,38 @@ def _solve_break_even(text: str) -> Computed | None:
             break
     if m is None:
         return None
-    fixed, price, var = to_decimal(m["f"]), to_decimal(m["price"]), to_decimal(m["v"])
-    margin = price - var
+    fixed = to_decimal(m["f"])
+    if m.groupdict().get("cm") is not None:
+        cur = _cur(m, "f", "cm", *(("tp",) if goal == "tp" else ()))
+        margin = to_decimal(m["cm"])
+        price = None
+        how = f"({fixed}+{{t}})/{margin}"
+    else:
+        cur = _cur(m, "f", "price", "v", *(("tp",) if goal == "tp" else ()))
+        price, var = to_decimal(m["price"]), to_decimal(m["v"])
+        margin = price - var
+        how = f"({fixed}+{{t}})/({price}-{var})"
     if margin <= 0:
         raise Abstain("no_contribution_margin", "price must exceed variable cost")
     target = to_decimal(m["tp"]) if goal == "tp" else Decimal(0)
     units = (fixed + target) / margin
-    how = f"({fixed}+{target})/({price}-{var})"
+    how = how.replace("{t}", str(target))
     if mode == "revenue":
-        return Computed(units * price, "money", "USD", f"break-even revenue {how}*{price}")
+        if price is None:
+            raise Abstain("revenue_needs_price", "break-even revenue needs the unit price")
+        return Computed(units * price, "money", cur, f"break-even revenue {how}*{price}")
     if mode == "nearest":
         return Computed(units.quantize(Decimal(1), rounding=ROUND_HALF_UP), "units", None,
                         f"units rounded half-up {how}")
     if mode == "ceil":
         return Computed(units.to_integral_value(rounding=ROUND_CEILING), "units", None,
                         f"units rounded up {how}")
-    return Computed(units, "units", None, f"units (no rounding phrase) {how}")
+    # No rounding phrase: the whole-unit answer is ambiguous (round vs. round up).  Accept
+    # only when no other option equals floor / ceil of the exact value.
+    if units == units.to_integral_value():
+        return Computed(units, "units", None, f"exact whole units {how}")
+    rivals = (units.to_integral_value(rounding=ROUND_FLOOR), units.to_integral_value(rounding=ROUND_CEILING))
+    return Computed(units, "units", None, f"units (no rounding phrase) {how}", rivals)
 
 
 # --------------------------------------------------------------------------
@@ -481,13 +550,23 @@ def _solve_break_even(text: str) -> Computed | None:
 _ORDINALS = {"first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4, "sixth": 5}
 _COUNT_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
                 "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
+_RS_RATIO = rf"{NUM}(?: ?: ?{NUM})+|{NUM}(?: to {NUM})+"
 _RS_HEAD = (
-    rf"an? {money_g('t')} (?P<what>[a-z][a-z\- ]{{0,40}}?) (?:is|are) "
+    rf"an? {money_g('t')} (?P<what>{phrase(3)}) (?:is|are) "
     r"(?:split|divided|shared|allocated|distributed) (?:between|among) "
-    r"(?P<who>[a-z0-9][a-z0-9\- ]{0,40}?) (?:in|at) (?:the|a) ratio (?:of )?"
-    rf"(?P<ratio>{NUM}(?: ?: ?{NUM})+)\. "
+    rf"(?P<who>{WORD_D}(?: {WORD_D}){{0,3}}) "
+    rf"(?:(?:in|at) (?:the|a) ratio (?:of )?(?P<ratio>{_RS_RATIO})"
+    rf"|(?:in|at) an? (?P<ratio2>{_RS_RATIO}) ratio)\. "
 )
-_WORDS2 = r"[a-z][a-z\-]*(?: [a-z][a-z\-]*)?"
+# The noun after "the first ..." must be a plain noun: not another ordinal / comparative /
+# selector ("the largest first channel", "the second other channel" are contradictory).
+_SELECTOR_WORDS = (
+    "first|second|third|fourth|fifth|sixth|last|larger|smaller|largest|smallest|other|"
+    "remaining|rest|combined|total|bigger|biggest|lesser|least|most|top|bottom|middle|"
+    "one|two|three|four|five|six"
+)
+_NOUN_W = rf"(?!(?:{_SELECTOR_WORDS})(?![a-z0-9\-'])){WORD}"
+_WORDS2 = rf"{_NOUN_W}(?: {_NOUN_W})?"
 _RS_TAILS = [
     rf"(?:what|how much) (?:does|will) the (?P<ord>first|second|third|fourth|fifth|sixth) {_WORDS2} (?:receive|get)\?",
     rf"(?:what|how much) (?:does|will) the (?P<cmp>larger|smaller|largest|smallest) {_WORDS2} (?:receive|get)\?",
@@ -502,7 +581,10 @@ def _solve_ratio_split(text: str) -> Computed | None:
     if m is None:
         return None
     total = to_decimal(m["t"])
-    parts = [to_decimal(p.strip()) for p in m["ratio"].split(":")]
+    cur = _cur(m, "t")
+    ratio_text = (m["ratio"] or m["ratio2"]).lower().replace(" to ", ":")
+    parts = [to_decimal(p.strip()) for p in ratio_text.split(":")]
+    gd = m.groupdict()
     first_word = m["who"].split()[0].lower()
     if first_word not in _COUNT_WORDS:
         raise Abstain("unclear_recipients", "cannot map ordinals onto the recipients")
@@ -511,42 +593,53 @@ def _solve_ratio_split(text: str) -> Computed | None:
     whole = sum(parts)
     if whole <= 0:
         raise Abstain("zero_denominator", "ratio parts sum to zero")
-    if m["ord"] is not None:
-        idx = _ORDINALS[m["ord"].lower()]
+    if gd.get("ord") is not None:
+        idx = _ORDINALS[gd["ord"].lower()]
         if idx >= len(parts):
-            raise Abstain("ordinal_out_of_range", m["ord"])
+            raise Abstain("ordinal_out_of_range", gd["ord"])
         share = parts[idx]
-        label = m["ord"].lower()
+        label = gd["ord"].lower()
     else:
-        cmp_word = m["cmp"].lower()
+        cmp_word = (gd.get("cmp") or "").lower()
+        if cmp_word not in ("larger", "smaller", "largest", "smallest"):
+            raise Abstain("no_selector", "neither an ordinal nor a comparative was matched")
         if cmp_word in ("larger", "smaller") and len(parts) != 2:
             raise Abstain("comparative_with_many", "larger/smaller needs exactly two parts")
         share = max(parts) if cmp_word in ("larger", "largest") else min(parts)
         label = cmp_word
-    return Computed(total * share / whole, "money", "USD", f"{label} share {total}*{share}/{whole}")
+    return Computed(total * share / whole, "money", cur, f"{label} share {total}*{share}/{whole}")
 
 
 # --------------------------------------------------------------------------
 # 9. weighted average
 # --------------------------------------------------------------------------
 
-_WA_GROUP = (
-    r"[a-z][a-z0-9\-]*(?: [a-z0-9\-]+){{0,2}} had {n} (?P<u>[a-z]+(?: [a-z]+)?) "
-    r"(?:averaging|with an average of|at an average of) {a}"
-)
+# Group label ("Region A", "the north store"): up to three words, no clause words.
+_WA_LABEL = rf"{WORD}(?: {WORD_D}){{0,2}}"
 _WA_GROUP_NC = (
-    r"[a-z][a-z0-9\-]*(?: [a-z0-9\-]+){0,2} had "
-    rf"{INT} [a-z]+(?: [a-z]+)? (?:averaging|with an average of|at an average of) \$?{NUM}"
+    rf"{_WA_LABEL} had "
+    rf"{INT} [a-z]+(?: [a-z]+)? (?:averaging|with an average of|at an average of) [$€£]?{NUM}"
 )
 _WA_GROUP_NAMED = _rx(
     r"[a-z][a-z0-9\-]*(?: [a-z0-9\-]+){0,2} had "
     rf"(?P<n>{INT}) (?P<u>[a-z]+(?: [a-z]+)?) "
-    rf"(?:averaging|with an average of|at an average of) (?P<d>\$)?(?P<a>{NUM})"
+    rf"(?:averaging|with an average of|at an average of) (?P<d>[$€£])?(?P<a>{NUM})"
 )
 _WA_SEP = r"(?:; and |, and |; |, | and )"
+# The question tail is a whitelist, NOT free words: "excluding region A", "for region A",
+# "without region B", "excluding returns" ... each change what is being averaged.
+_WA_NOUNS = (
+    r"(?:order|purchase|sale|sales|ticket|transaction|basket|invoice|customer|student|employee"
+    r"|item|unit|product|test|exam|value|size|amount|spend|price|cost|total|score|grade|rating"
+    r"|salary|wage|age|weight|time|duration)"
+)
+_WA_TAIL = (
+    r"what is the (?:overall|combined|weighted|blended) (?:average|mean)"
+    rf"(?: {_WA_NOUNS}){{0,2}}"
+    r"(?P<scope> across (?:both|all|the two|all the) [a-z]+)?\?"
+)
 _WA_RX = _rx(
-    rf"(?P<body>{_WA_GROUP_NC}(?:{_WA_SEP}{_WA_GROUP_NC}){{1,5}})\. "
-    r"what is the (?:overall|combined|weighted|blended)(?: average)?(?: [a-z]+){0,3}\?"
+    rf"(?P<body>{_WA_GROUP_NC}(?:{_WA_SEP}{_WA_GROUP_NC}){{1,5}})\. {_WA_TAIL}"
 )
 
 
@@ -555,22 +648,25 @@ def _solve_weighted_average(text: str) -> Computed | None:
     if m is None:
         return None
     groups = [g for g in _WA_GROUP_NAMED.finditer(m["body"])]
-    if len(groups) < 2:
+    if len(groups) < 2 or len(groups) != m["body"].lower().count(" had "):
         raise Abstain("group_parse", "could not isolate the groups")
+    scope = (m["scope"] or "").lower()
+    if (" both " in scope or " the two " in scope) and len(groups) != 2:
+        raise Abstain("scope_mismatch", "'both' used with a number of groups other than two")
     units = {g["u"].lower() for g in groups}
-    dollars = {g["d"] is not None for g in groups}
+    dollars = {g["d"] for g in groups}
     if len(units) != 1:
         raise Abstain("mixed_units", "groups count different things")
     if len(dollars) != 1:
-        raise Abstain("mixed_units", "some averages carry a $ and some do not")
+        raise Abstain("mixed_units", "averages carry different (or only some) currency symbols")
     weights = [to_decimal(g["n"]) for g in groups]
     avgs = [to_decimal(g["a"]) for g in groups]
     total_w = sum(weights)
     if total_w <= 0:
         raise Abstain("zero_denominator", "total weight is zero")
     value = sum(w * a for w, a in zip(weights, avgs)) / total_w
-    is_money = dollars.pop()
-    return Computed(value, "money" if is_money else "number", "USD" if is_money else None,
+    symbol = dollars.pop()
+    return Computed(value, "money" if symbol else "number", _SYM_ISO[symbol] if symbol else None,
                     f"weighted mean of {len(groups)} groups")
 
 
@@ -601,6 +697,8 @@ _CUR_QS = [
     rf"what is (?:that|this) in (?P<q>{CUR_RE})\?",
     rf"how much is (?:that|this) in (?P<q>{CUR_RE})\?",
     rf"what is the (?:converted|resulting) amount in (?P<q>{CUR_RE})\?",
+    rf"what is the equivalent in (?P<q>{CUR_RE})\?",
+    rf"how many (?P<q>{CUR_RE}) does (?:that|this|it) (?:make|come to|equal|amount to|total)\?",
 ]
 _CUR_RX = [_rx(h + q) for h in _CUR_HEADS for q in _CUR_QS]
 
@@ -645,8 +743,9 @@ _PR_RX = _rx(
     rf"(?P<cats>{_PR_CAT}(?:(?:, and |, | and ){_PR_CAT}){{1,5}})\. "
     r"if (?:one|one item|one ticket|a single item|an item|a ticket) is "
     r"(?:drawn|chosen|picked|selected|pulled) (?:at random|randomly), "
-    r"what is the probability (?:that )?(?:it|the item|the ticket|the item drawn) is "
-    r"(?P<neg>not )?(?P<tgt>an? [a-z\- ,]+?)\?"
+    r"what (?:is the (?:probability|chance)|are the chances) (?:that )?"
+    r"(?:it|the item|the ticket|the item drawn) is "
+    r"(?P<neg>not )?(?:either )?(?P<tgt>(?:an? )?[a-z\- ,]+?)\?"
 )
 _PR_SPLIT = re.compile(r"(?:, and |, | and )(?=\d)")
 _PR_PIECE = re.compile(r"(\d+) ((?:[a-z\-]+ )*[a-z\-]+)", re.I | re.A)
@@ -706,7 +805,8 @@ def _solve_probability(text: str) -> Computed | None:
 _TR_RX = _rx(
     rf"{SUBJ} (?:sells|sold) (?P<n>{INT}) [a-z]+(?: [a-z]+)? at {money_g('p')} "
     r"(?:each|per unit|apiece|per item|a piece|per piece)\. "
-    r"what is (?:the )?total (?:sales )?revenue\?"
+    r"(?:what is (?:the )?(?:total )?(?:sales )?revenue(?: in dollars)?"
+    r"|how much (?:total )?(?:sales )?revenue does (?:it|the [a-z]+) (?:generate|earn|make|bring in))\?"
 )
 
 
@@ -715,7 +815,7 @@ def _solve_total_revenue(text: str) -> Computed | None:
     if m is None:
         return None
     units, price = to_decimal(m["n"]), to_decimal(m["p"])
-    return Computed(units * price, "money", "USD", f"{units}*{price}")
+    return Computed(units * price, "money", _cur(m, "p"), f"{units}*{price}")
 
 
 # --------------------------------------------------------------------------
